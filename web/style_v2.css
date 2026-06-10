@@ -1,0 +1,888 @@
+/* ============================================================
+   LYRICS NOTEPAD — Premium Dark Terminal Design
+   ============================================================ */
+
+/* CSS Custom Properties */
+:root {
+    --bg-deep: #08090d;
+    --bg-surface: #0f1117;
+    --bg-panel: #161822;
+    --bg-elevated: #1c1f2e;
+    --border-subtle: rgba(255, 255, 255, 0.06);
+    --border-glow: rgba(139, 92, 246, 0.3);
+    --text-primary: #e2e8f0;
+    --text-secondary: #8892a4;
+    --text-muted: #4a5568;
+    --accent-primary: #8b5cf6;     /* Violet */
+    --accent-secondary: #06b6d4;   /* Cyan */
+    --accent-hot: #ec4899;         /* Pink/Magenta */
+    --accent-glow: rgba(139, 92, 246, 0.15);
+    --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    --font-ui: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+    --beat-duration: 0.8s;
+    --transition-smooth: 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Reset */
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+/* Fonts */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+/* Body */
+body {
+    font-family: var(--font-ui);
+    height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    overflow: hidden;
+    background: var(--bg-deep);
+    transition: background var(--transition-smooth);
+    user-select: none;
+}
+
+/* ============================================================
+   Main Window Container
+   ============================================================ */
+.notepad-window {
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    overflow: hidden;
+    position: relative;
+    transition: all var(--transition-smooth);
+}
+
+/* ============================================================
+   Title Bar
+   ============================================================ */
+.title-bar {
+    height: 42px;
+    background: var(--bg-panel);
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--border-subtle);
+    transition: all var(--transition-smooth);
+    -webkit-app-region: drag;
+}
+
+.tabs-container {
+    display: flex;
+    align-items: flex-end;
+    height: 34px;
+    -webkit-app-region: no-drag;
+}
+
+.tab {
+    display: flex;
+    align-items: center;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-bottom: none;
+    border-radius: 8px 8px 0 0;
+    padding: 6px 14px;
+    font-size: 12px;
+    font-weight: 500;
+    height: 30px;
+    margin-right: 2px;
+    color: var(--text-secondary);
+    max-width: 220px;
+    min-width: 100px;
+    transition: all 0.2s ease;
+    letter-spacing: 0.02em;
+}
+
+.tab.active {
+    background: var(--bg-surface);
+    border-color: var(--border-subtle);
+    border-bottom: 1px solid var(--bg-surface);
+    color: var(--text-primary);
+    height: 32px;
+}
+
+.tab-icon {
+    margin-right: 7px;
+    font-size: 12px;
+    opacity: 0.7;
+}
+
+.tab-title {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex-grow: 1;
+    font-family: var(--font-ui);
+}
+
+.tab-close {
+    margin-left: 10px;
+    font-size: 14px;
+    cursor: pointer;
+    border-radius: 4px;
+    width: 18px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.4;
+    transition: all 0.15s;
+}
+
+.tab-close:hover {
+    background: rgba(255, 255, 255, 0.1);
+    opacity: 1;
+}
+
+.tab-add {
+    font-size: 16px;
+    margin-left: 4px;
+    margin-bottom: 4px;
+    cursor: pointer;
+    color: var(--text-muted);
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: all 0.15s;
+    -webkit-app-region: no-drag;
+}
+
+.tab-add:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-secondary);
+}
+
+.window-controls {
+    display: flex;
+    align-self: flex-start;
+    margin-right: -12px;
+    -webkit-app-region: no-drag;
+}
+
+.control-btn {
+    width: 46px;
+    height: 34px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    font-size: 10px;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.control-btn:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-secondary);
+}
+
+.close-btn:hover {
+    background: #e81123 !important;
+    color: #ffffff !important;
+}
+
+/* ============================================================
+   Menu Bar
+   ============================================================ */
+.menu-bar {
+    height: 32px;
+    background: var(--bg-panel);
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-secondary);
+    position: relative;
+    transition: all var(--transition-smooth);
+}
+
+.menu-item {
+    padding: 4px 10px;
+    margin-right: 2px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.01em;
+}
+
+.menu-item:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-primary);
+}
+
+.active-track-indicator {
+    margin-left: auto;
+    font-weight: 600;
+    font-size: 11px;
+    color: var(--accent-secondary);
+    background: rgba(6, 182, 212, 0.08);
+    padding: 3px 12px;
+    border-radius: 100px;
+    border: 1px solid rgba(6, 182, 212, 0.15);
+    max-width: 45%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: all var(--transition-smooth);
+    letter-spacing: 0.02em;
+}
+
+/* ============================================================
+   Editor / Lyrics Area
+   ============================================================ */
+.editor-container {
+    flex-grow: 1;
+    position: relative;
+    overflow: hidden;
+    background: var(--bg-deep);
+    display: flex;
+    flex-direction: column;
+    transition: all var(--transition-smooth);
+}
+
+.notepad-textarea {
+    width: 100%;
+    height: 100%;
+    border: none;
+    outline: none;
+    font-family: var(--font-mono);
+    font-size: 15px;
+    font-weight: 500;
+    line-height: 1.75;
+    padding: 20px 24px 90px 24px; /* Pad bottom by 90px to prevent text from being covered by equalizer */
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-y: auto;
+    flex-grow: 1;
+    background: transparent;
+    transition: all var(--transition-smooth);
+    letter-spacing: 0.03em;
+}
+
+.edit-textarea {
+    background: transparent;
+    color: var(--text-primary);
+    resize: none;
+    caret-color: var(--accent-primary);
+}
+.edit-textarea:focus {
+    outline: none;
+    border: none;
+}
+
+/* Custom Scrollbar */
+.notepad-textarea::-webkit-scrollbar {
+    width: 6px;
+}
+.notepad-textarea::-webkit-scrollbar-track {
+    background: transparent;
+}
+.notepad-textarea::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 3px;
+}
+.notepad-textarea::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.15);
+}
+
+/* History text = dimmer */
+.lyrics-history {
+    color: var(--text-muted);
+    transition: color var(--transition-smooth);
+}
+
+/* Current line = bright and highlighted */
+.current-word-container {
+    color: var(--text-primary);
+    font-weight: 600;
+    transition: color var(--transition-smooth);
+}
+
+/* Cursor */
+.cursor {
+    font-weight: 700;
+    color: var(--accent-primary);
+    animation: blink 1s step-end infinite;
+    text-shadow: 0 0 8px var(--accent-glow);
+}
+
+@keyframes blink {
+    50% { opacity: 0; }
+}
+
+/* ============================================================
+   Status Bar
+   ============================================================ */
+.status-bar {
+    height: 24px;
+    background: var(--bg-panel);
+    border-top: 1px solid var(--border-subtle);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 14px;
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--text-muted);
+    transition: all var(--transition-smooth);
+    letter-spacing: 0.02em;
+}
+
+.status-left {
+    display: flex;
+    gap: 18px;
+}
+
+.status-right {
+    display: flex;
+    gap: 18px;
+}
+
+/* ============================================================
+   Glitch / CRT Overlay
+   ============================================================ */
+.glitch-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: repeating-linear-gradient(
+        0deg,
+        rgba(0, 0, 0, 0.03),
+        rgba(0, 0, 0, 0.03) 1px,
+        transparent 1px,
+        transparent 2px
+    );
+    pointer-events: none;
+    z-index: 5;
+    display: none;
+    opacity: 0;
+    transition: opacity 0.3s;
+}
+
+/* ============================================================
+   Sync Button
+   ============================================================ */
+#sync-btn {
+    color: var(--accent-primary);
+    font-weight: 600;
+    margin-left: 8px;
+    border: 1px solid rgba(139, 92, 246, 0.2);
+    background: rgba(139, 92, 246, 0.06);
+    transition: all 0.2s ease;
+    font-size: 11px;
+}
+
+#sync-btn:hover {
+    background: rgba(139, 92, 246, 0.15);
+    border-color: rgba(139, 92, 246, 0.4);
+    box-shadow: 0 0 12px rgba(139, 92, 246, 0.15);
+}
+
+/* ============================================================
+   THEME: CALM (Default — Clean Dark)
+   ============================================================ */
+body.theme-calm {
+    background: var(--bg-deep);
+}
+
+body.theme-calm .notepad-window {
+    animation: none;
+}
+
+/* ============================================================
+   THEME: ENERGETIC (Cyan Glow)
+   ============================================================ */
+body.theme-energetic {
+    background: #060a10;
+}
+
+body.theme-energetic .notepad-window {
+    border-color: rgba(6, 182, 212, 0.12);
+    /* Beat-reactive pulse animation is driven dynamically in JS */
+}
+
+body.theme-energetic .title-bar {
+    border-bottom-color: rgba(6, 182, 212, 0.1);
+}
+
+body.theme-energetic .editor-container {
+    background: linear-gradient(180deg, #060a10 0%, #0a1018 100%);
+}
+
+body.theme-energetic .current-word-container {
+    color: #e2f1ff;
+    text-shadow: 0 0 20px rgba(6, 182, 212, 0.15);
+}
+
+body.theme-energetic .lyrics-history {
+    color: #3a5068;
+}
+
+body.theme-energetic .cursor {
+    color: var(--accent-secondary);
+    text-shadow: 0 0 10px rgba(6, 182, 212, 0.5);
+}
+
+body.theme-energetic .active-track-indicator {
+    color: var(--accent-secondary);
+    border-color: rgba(6, 182, 212, 0.25);
+    background: rgba(6, 182, 212, 0.08);
+}
+
+body.theme-energetic .status-bar {
+    border-top-color: rgba(6, 182, 212, 0.1);
+}
+
+body.theme-energetic #sync-btn {
+    color: var(--accent-secondary);
+    border-color: rgba(6, 182, 212, 0.2);
+    background: rgba(6, 182, 212, 0.06);
+}
+
+/* ============================================================
+   THEME: DRAMATIC (Neon Violet + Magenta — Full Intensity)
+   ============================================================ */
+body.theme-dramatic {
+    background: #030108;
+}
+
+body.theme-dramatic .notepad-window {
+    border-color: var(--accent-primary);
+    box-shadow: 
+        0 0 30px rgba(139, 92, 246, 0.1),
+        inset 0 0 60px rgba(139, 92, 246, 0.03);
+    /* Beat-reactive pulse & shake animations are driven dynamically in JS */
+}
+
+body.theme-dramatic .title-bar {
+    background: linear-gradient(90deg, #0d0618 0%, #12081f 50%, #0d0618 100%);
+    border-bottom-color: rgba(139, 92, 246, 0.2);
+}
+
+body.theme-dramatic .tab.active {
+    color: var(--accent-primary);
+    border-color: rgba(139, 92, 246, 0.3);
+    background: rgba(139, 92, 246, 0.05);
+}
+
+body.theme-dramatic .tab {
+    color: rgba(139, 92, 246, 0.5);
+    border-color: rgba(139, 92, 246, 0.1);
+}
+
+body.theme-dramatic .control-btn {
+    color: rgba(139, 92, 246, 0.5);
+}
+
+body.theme-dramatic .menu-bar {
+    background: linear-gradient(90deg, #0d0618 0%, #12081f 50%, #0d0618 100%);
+    border-bottom-color: rgba(139, 92, 246, 0.15);
+    color: rgba(139, 92, 246, 0.7);
+}
+
+body.theme-dramatic .editor-container {
+    background: radial-gradient(ellipse at center, #0a0515 0%, #030108 70%);
+}
+
+body.theme-dramatic .notepad-textarea {
+    font-size: 17px;
+    font-weight: 700;
+    text-transform: uppercase;
+    line-height: 1.65;
+}
+
+body.theme-dramatic .lyrics-history {
+    color: rgba(139, 92, 246, 0.25);
+}
+
+body.theme-dramatic .current-word-container {
+    color: #ffffff;
+    text-shadow: 
+        0 0 10px rgba(139, 92, 246, 0.6),
+        0 0 30px rgba(139, 92, 246, 0.2);
+}
+
+body.theme-dramatic .cursor {
+    color: var(--accent-hot);
+    text-shadow: 0 0 12px rgba(236, 72, 153, 0.7);
+    animation: blink-fast 0.3s step-end infinite;
+}
+
+body.theme-dramatic .active-track-indicator {
+    color: #ffffff;
+    background: linear-gradient(135deg, var(--accent-primary), var(--accent-hot));
+    border-color: transparent;
+    box-shadow: 0 0 15px rgba(139, 92, 246, 0.3);
+}
+
+body.theme-dramatic .status-bar {
+    background: linear-gradient(90deg, #0d0618 0%, #12081f 50%, #0d0618 100%);
+    border-top-color: rgba(139, 92, 246, 0.2);
+    color: rgba(139, 92, 246, 0.5);
+}
+
+body.theme-dramatic .glitch-overlay {
+    display: block;
+    opacity: 0.4;
+    animation: crt-flicker 0.12s infinite;
+}
+
+body.theme-dramatic #sync-btn {
+    color: #ffffff;
+    border-color: transparent;
+    background: linear-gradient(135deg, var(--accent-primary), var(--accent-hot));
+    box-shadow: 0 0 12px rgba(139, 92, 246, 0.3);
+}
+
+body.theme-dramatic #sync-btn:hover {
+    box-shadow: 0 0 20px rgba(139, 92, 246, 0.5);
+    transform: scale(1.02);
+}
+
+/* ============================================================
+   ANIMATIONS
+   ============================================================ */
+
+@keyframes pulse-energetic {
+    0%, 100% { 
+        transform: scale(1.0); 
+        box-shadow: 0 0 20px rgba(6, 182, 212, 0.03);
+    }
+    5% { 
+        transform: scale(1.006); 
+        box-shadow: 0 0 35px rgba(6, 182, 212, 0.2);
+    }
+    15% {
+        transform: scale(1.003);
+    }
+    45% {
+        transform: scale(1.0);
+    }
+}
+
+@keyframes pulse-dramatic {
+    0%, 100% { 
+        transform: scale(1.0) translate(0, 0); 
+        box-shadow: 0 0 25px rgba(139, 92, 246, 0.1), inset 0 0 60px rgba(139, 92, 246, 0.03);
+        border-color: var(--accent-primary);
+    }
+    5% {
+        transform: scale(1.018) translate(-3px, 1px);
+        border-color: var(--accent-hot);
+        box-shadow: 0 0 45px rgba(236, 72, 153, 0.3), inset 0 0 70px rgba(139, 92, 246, 0.06);
+    }
+    12% {
+        transform: scale(1.014) translate(3px, -1px);
+    }
+    20% {
+        transform: scale(1.01) translate(-2px, -2px);
+    }
+    28% {
+        transform: scale(1.006) translate(2px, 2px);
+    }
+    35% {
+        transform: scale(1.003) translate(-1px, -1px);
+    }
+    45% {
+        transform: scale(1.001) translate(1px, 0);
+    }
+    55% {
+        transform: scale(1.0) translate(0, 0);
+    }
+}
+
+@keyframes blink-fast {
+    50% { opacity: 0; }
+}
+
+@keyframes crt-flicker {
+    0% { opacity: 0.3; }
+    50% { opacity: 0.5; }
+    100% { opacity: 0.35; }
+}
+
+/* Subtle float for calm state */
+@keyframes float-gentle {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-1px); }
+}
+
+/* ============================================================
+   Equalizer Styling
+   ============================================================ */
+.equalizer {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 50px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 1px; /* Minimal gap between bars for wall-to-wall look */
+    padding: 0; /* No padding on sides so it spans fully from left to right wall */
+    background: linear-gradient(180deg, transparent 0%, rgba(8, 9, 13, 0.95) 100%);
+    pointer-events: none; /* Let clicks pass through to textarea */
+    z-index: 10;
+    transition: all var(--transition-smooth);
+}
+
+.eq-bar {
+    flex-grow: 1;
+    height: 3px;
+    background: var(--text-muted);
+    border-radius: 1px 1px 0 0;
+    opacity: 0.25;
+    transition: background var(--transition-smooth), opacity var(--transition-smooth);
+    /* No CSS height transitions/animations to ensure smooth real-time rendering in JS */
+}
+
+/* Pause State Override */
+.equalizer.paused .eq-bar {
+    height: 3px !important;
+    opacity: 0.12 !important;
+    box-shadow: none !important;
+    background: var(--text-muted) !important;
+}
+
+/* Theme integration */
+body.theme-calm .equalizer {
+    background: linear-gradient(180deg, transparent 0%, rgba(15, 17, 23, 0.85) 100%);
+    height: 35px;
+}
+body.theme-calm .eq-bar {
+    background: var(--text-muted);
+    opacity: 0.25;
+}
+
+body.theme-energetic .equalizer {
+    background: linear-gradient(180deg, transparent 0%, rgba(6, 10, 16, 0.85) 100%);
+    height: 55px;
+}
+body.theme-energetic .eq-bar {
+    background: var(--accent-secondary);
+    opacity: 0.6;
+    box-shadow: 0 0 8px rgba(6, 182, 212, 0.3);
+}
+
+body.theme-dramatic .equalizer {
+    background: linear-gradient(180deg, transparent 0%, rgba(3, 1, 8, 0.95) 100%);
+    height: 75px;
+}
+body.theme-dramatic .eq-bar {
+    background: linear-gradient(0deg, var(--accent-primary) 0%, var(--accent-hot) 100%);
+    opacity: 0.9;
+    box-shadow: 
+        0 0 10px rgba(139, 92, 246, 0.5),
+        0 0 20px rgba(236, 72, 153, 0.2);
+}
+
+/* ============================================================
+   Offset Adjustment Buttons & Status Styling
+   ============================================================ */
+.offset-adjust-btn {
+    border: 1px solid var(--border-subtle);
+    background: rgba(255, 255, 255, 0.02);
+    margin-left: 4px;
+    font-size: 11px;
+    opacity: 0.8;
+}
+
+.offset-adjust-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.15);
+    opacity: 1;
+}
+
+/* Theme integration for offset buttons */
+body.theme-energetic .offset-adjust-btn {
+    border-color: rgba(6, 182, 212, 0.15);
+    background: rgba(6, 182, 212, 0.03);
+    color: var(--accent-secondary);
+}
+
+body.theme-energetic .offset-adjust-btn:hover {
+    background: rgba(6, 182, 212, 0.1);
+    border-color: rgba(6, 182, 212, 0.3);
+}
+
+body.theme-dramatic .offset-adjust-btn {
+    border-color: rgba(139, 92, 246, 0.2);
+    background: rgba(139, 92, 246, 0.03);
+    color: var(--accent-primary);
+}
+
+body.theme-dramatic .offset-adjust-btn:hover {
+    background: rgba(139, 92, 246, 0.1);
+    border-color: rgba(139, 92, 246, 0.4);
+    color: #ffffff;
+}
+
+#status-offset {
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+body.theme-energetic #status-offset {
+    color: var(--accent-secondary);
+}
+
+body.theme-dramatic #status-offset {
+    color: var(--accent-primary);
+}
+
+/* Settings Modal */
+.modal-overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0, 0, 0, 0.4);
+    z-index: 1000;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    backdrop-filter: blur(5px);
+}
+
+.modal-content {
+    background: rgba(30, 30, 35, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    width: 400px;
+    max-width: 90%;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    backdrop-filter: blur(15px);
+    overflow: hidden;
+    color: var(--text-primary);
+    animation: modalSlideIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+@keyframes modalSlideIn {
+    from { opacity: 0; transform: translateY(40px) scale(0.95); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 15px 20px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    background: rgba(0, 0, 0, 0.2);
+}
+
+.modal-header h2 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 500;
+}
+
+.modal-close {
+    cursor: pointer;
+    font-size: 24px;
+    line-height: 1;
+    color: var(--text-secondary);
+    transition: color 0.2s;
+}
+
+.modal-close:hover {
+    color: var(--accent-hot);
+}
+
+.modal-body {
+    padding: 10px 20px 20px;
+}
+
+.setting-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 15px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.setting-item:last-child {
+    border-bottom: none;
+}
+
+.setting-info h3 {
+    margin: 0 0 5px 0;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.setting-info p {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+/* Switch Toggle */
+.switch {
+    position: relative;
+    display: inline-block;
+    width: 44px;
+    height: 24px;
+    flex-shrink: 0;
+}
+
+.switch input { 
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background-color: rgba(255, 255, 255, 0.1);
+    transition: .3s;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.slider:before {
+    position: absolute;
+    content: "";
+    height: 18px;
+    width: 18px;
+    left: 2px;
+    bottom: 2px;
+    background-color: white;
+    transition: .3s;
+}
+
+input:checked + .slider {
+    background-color: var(--accent-primary);
+    border-color: var(--accent-primary);
+}
+
+input:checked + .slider:before {
+    transform: translateX(20px);
+}
+
+.slider.round {
+    border-radius: 24px;
+}
+
+.slider.round:before {
+    border-radius: 50%;
+}
+
+/* Blur toggle logic */
+body.no-blur .notepad-window {
+    backdrop-filter: none;
+    background: rgba(18, 18, 20, 0.95);
+}

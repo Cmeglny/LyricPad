@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lyrics — Notepad</title>
+    <link rel="stylesheet" href="style_v2.css">
+</head>
+<body class="theme-calm">
+    <div id="notepad-window" class="notepad-window">
+        <!-- Title bar -->
+        <div class="title-bar">
+            <div class="tabs-container">
+                <div class="tab active">
+                    <span class="tab-icon">♫</span>
+                    <span id="tab-title" class="tab-title">Untitled.txt</span>
+                    <span class="tab-close">×</span>
+                </div>
+                <div class="tab-add">+</div>
+            </div>
+            <div class="window-controls">
+                <div class="control-btn min-btn">─</div>
+                <div class="control-btn max-btn">❑</div>
+                <div class="control-btn close-btn">✕</div>
+            </div>
+        </div>
+
+        <!-- Menu Bar -->
+        <div class="menu-bar">
+            <span class="menu-item">File</span>
+            <span class="menu-item">Edit</span>
+            <span class="menu-item">View</span>
+            <span class="menu-item" id="sync-btn">⟳ Sync</span>
+            <span class="menu-item" id="settings-btn">⚙️ Settings</span>
+            <span class="menu-item" id="edit-lyrics-btn">✎ Edit Lyrics</span>
+            <span class="menu-item" id="cancel-edit-btn" style="display: none; color: var(--accent-hot);">❌ Cancel</span>
+            <span class="menu-item offset-adjust-btn" id="offset-dec-btn" title="Shift lyrics later (Delay lyrics, shortcut: [ )">⏪ -0.5s</span>
+            <span class="menu-item offset-adjust-btn" id="offset-inc-btn" title="Shift lyrics earlier (Speed up, shortcut: ] )">⏩ +0.5s</span>
+            <div class="active-track-indicator" id="active-track">
+                No music playing
+            </div>
+        </div>
+
+        <!-- Editor -->
+        <div class="editor-container" id="editor-container">
+            <div class="glitch-overlay" id="glitch-overlay"></div>
+            <div class="notepad-textarea" id="notepad-textarea"><span class="lyrics-history" id="lyrics-history"></span><span class="current-word-container" id="current-line-span"></span><span class="cursor" id="cursor">│</span></div>
+            <textarea class="notepad-textarea edit-textarea" id="edit-textarea" style="display: none;" placeholder="Edit lyrics here..."></textarea>
+            <!-- Dynamic Simulated Equalizer -->
+            <div class="equalizer paused" id="equalizer"></div>
+        </div>
+
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <div class="status-left">
+                <span id="status-source">⦿ Offline</span>
+                <span id="status-intensity">Intensity: —</span>
+                <span id="status-bpm">BPM: —</span>
+                <span id="status-offset">Offset: 0.0s</span>
+            </div>
+            <div class="status-right">
+                <span>UTF-8</span>
+                <span>CRLF</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal-overlay" style="display: none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>⚙️ Settings</h2>
+                <span class="modal-close" id="settings-close-btn">×</span>
+            </div>
+            <div class="modal-body">
+                <div class="setting-item">
+                    <div class="setting-info">
+                        <h3>Typewriter Effect</h3>
+                        <p>Animate lyrics typing out smoothly.</p>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="setting-typewriter" checked>
+                        <span class="slider round"></span>
+                    </label>
+                </div>
+                <div class="setting-item">
+                    <div class="setting-info">
+                        <h3>Climax Popups</h3>
+                        <p>Explosive floating popups during intense drops.</p>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="setting-popups" checked>
+                        <span class="slider round"></span>
+                    </label>
+                </div>
+                <div class="setting-item">
+                    <div class="setting-info">
+                        <h3>Window Shake</h3>
+                        <p>Shake the main window on heavy bass kicks.</p>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="setting-shake" checked>
+                        <span class="slider round"></span>
+                    </label>
+                </div>
+                <div class="setting-item">
+                    <div class="setting-info">
+                        <h3>Background Blur</h3>
+                        <p>Glassmorphism blur. Disable for better performance.</p>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="setting-blur" checked>
+                        <span class="slider round"></span>
+                    </label>
+                </div>
+                <div class="setting-item">
+                    <div class="setting-info">
+                        <h3>Instrumental Notes (♪)</h3>
+                        <p>Show music icon during long instrumental gaps.</p>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="setting-notes" checked>
+                        <span class="slider round"></span>
+                    </label>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app_v2.js"></script>
+</body>
+</html>

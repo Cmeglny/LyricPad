@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project specific caches
+.lyrics_cache/
+
+# OS specific
+.DS_Store
+Thumbs.db
