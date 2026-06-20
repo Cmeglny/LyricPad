@@ -1,9 +1,16 @@
 import hashlib
 import json
 import os
+import sys
 import re
 import syncedlyrics
 import requests
+
+# Fix SSL certificate issues for PyInstaller executable on other computers
+if getattr(sys, 'frozen', False):
+    import certifi
+    os.environ['SSL_CERT_FILE'] = certifi.where()
+    os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".lyrics_cache")
 
@@ -88,14 +95,20 @@ def score_lyrics(lrc_text: str) -> float:
         
     score = 0.0
     
+    # Check for standard LRC timestamps. If missing, it's unsynced plain text.
+    line_timestamps = len(re.findall(r'\[\d+:\d+(?:\.\d+)?\]', lrc_text))
+    if line_timestamps < 3:
+        return -9999.0
+        
+    # Base score on number of synced lines
+    score += line_timestamps * 1.5
+    
     # Check for enhanced word-level timestamps (e.g. <00:12.34>)
     word_tags = len(re.findall(r'<\d+:\d+(?:\.\d+)?>', lrc_text))
     if word_tags > 0:
         score += 200.0 + word_tags * 0.5
         
-    # Content line count contribution
     lines = lrc_text.splitlines()
-    score += len(lines) * 1.5
     
     # Deduct points for advertisements or credit headers/footers
     ad_patterns = [
@@ -179,6 +192,7 @@ def fetch_synced_lyrics(query: str, duration: float = 0.0, artist: str = None, t
     try:
         print(f"[CACHE MISS] Fetching synced lyrics for: '{cache_key}'...")
         lrc_content = None
+        plain_content = None
         
         # 1. Try querying LRCLIB's /api/get endpoint directly using the song signature (including duration)
         if artist and title and duration > 0.0:
@@ -194,10 +208,14 @@ def fetch_synced_lyrics(query: str, duration: float = 0.0, artist: str = None, t
                 resp = requests.get(url, params=params, headers=headers, timeout=6.0)
                 if resp.status_code == 200:
                     data = resp.json()
-                    lrc_content = data.get("syncedLyrics") or data.get("plainLyrics")
-                    if lrc_content:
+                    lrc_content = data.get("syncedLyrics")
+                    plain_content = data.get("plainLyrics")
+                    if lrc_content and lrc_content.strip() != "":
                         print("[LRCLIB] Successfully matched exact version by duration!")
                         lrc_content = clean_lrc_content(lrc_content)
+                    else:
+                        print("[LRCLIB] Exact match found, but no synced lyrics available. Falling back to multi-source...")
+                        lrc_content = None
                 else:
                     print(f"[LRCLIB] No exact duration match found (Status: {resp.status_code})")
             except Exception as e:
@@ -205,7 +223,7 @@ def fetch_synced_lyrics(query: str, duration: float = 0.0, artist: str = None, t
                 
         # 2. Fallback to standard provider searches if duration query fails or not provided
         if not lrc_content:
-            providers = ["Lrclib", "NetEase", "Megalobiz"]
+            providers = ["Lrclib", "Musixmatch", "NetEase", "Megalobiz"]
             print(f"[MULTISOURCE] Fetching from providers in parallel: {providers}")
             
             import concurrent.futures
@@ -219,12 +237,18 @@ def fetch_synced_lyrics(query: str, duration: float = 0.0, artist: str = None, t
                     return provider, None
             
             results = {}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                future_to_provider = {executor.submit(fetch_single, p): p for p in providers}
-                for future in concurrent.futures.as_completed(future_to_provider, timeout=12.0):
-                    provider, content = future.result()
-                    if content:
-                        results[provider] = content
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
+                    future_to_provider = {executor.submit(fetch_single, p): p for p in providers}
+                    try:
+                        for future in concurrent.futures.as_completed(future_to_provider, timeout=12.0):
+                            provider, content = future.result()
+                            if content:
+                                results[provider] = content
+                    except concurrent.futures.TimeoutError:
+                        print("[MULTISOURCE] One or more providers timed out, proceeding with collected results.")
+            except Exception as e:
+                print(f"[MULTISOURCE] ThreadPoolExecutor error: {e}")
                         
             # Score each provider's result
             best_provider = None
@@ -243,13 +267,20 @@ def fetch_synced_lyrics(query: str, duration: float = 0.0, artist: str = None, t
                 print(f"[SCORER] Selected best provider: '{best_provider}' (Score: {best_score:.1f})")
                 lrc_content = clean_lrc_content(best_content)
             else:
-                print("[MULTISOURCE] No lyrics found from any provider.")
+                print("[MULTISOURCE] No synced lyrics found from any provider.")
+                if plain_content:
+                    print("Falling back to plain text lyrics from LRCLIB.")
+                    lrc_content = plain_content
 
         if lrc_content:
             parsed = parse_lrc(lrc_content)
-            print(f"Successfully fetched {len(parsed)} synced lyric lines.")
-            result = {"offset": 0.0, "lyrics": parsed}
-            # Cache the parsed result
+            if len(parsed) == 0 and len(lrc_content.strip()) > 0:
+                print("Returning plain text lyrics (no sync).")
+                result = {"offset": 0.0, "lyrics": [], "plain_lyrics": clean_lrc_content(lrc_content)}
+            else:
+                print(f"Successfully fetched {len(parsed)} synced lyric lines.")
+                result = {"offset": 0.0, "lyrics": parsed}
+            # Cache the result
             try:
                 with open(cache_path, "w", encoding="utf-8") as f:
                     json.dump(result, f, indent=4, ensure_ascii=False)

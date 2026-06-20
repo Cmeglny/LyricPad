@@ -25,6 +25,19 @@ from media_session import MediaSessionTracker
 from lyrics_provider import fetch_synced_lyrics
 from bpm_provider import BPMProvider
 from audio_analyzer import AudioAnalyzer
+from cover_manager import CoverManager
+
+cover_manager = CoverManager()
+
+def resolve_lyrics_cache_path(artist: str, title: str, duration: float = 0.0) -> str:
+    """Resolves the on-disk lyrics cache file, preferring duration-specific keys."""
+    from lyrics_provider import get_cache_path
+    query = f"{artist} {title}"
+    if duration > 0.0:
+        duration_path = get_cache_path("lyrics", f"{query}_{int(duration)}")
+        if os.path.exists(duration_path):
+            return duration_path
+    return get_cache_path("lyrics", query)
 
 # Global States
 connected_clients = set()
@@ -32,6 +45,8 @@ last_track_payload = None
 last_position_payload = None
 force_sync_trigger = False
 current_track_offset = 0.0  # Real-time timing offset in seconds
+is_client_fullscreen = False
+
 
 # Music sync globals for desktop window shake and pulse physics
 current_song_bpm = 120.0
@@ -40,12 +55,10 @@ current_playback_position = 0.0
 last_position_update_time = time.time()
 is_playback_paused = True
 
-def save_offset_to_cache(artist: str, title: str, offset: float):
+def save_offset_to_cache(artist: str, title: str, offset: float, duration: float = 0.0):
     """Saves the user adjusted lyric sync offset back to the song's JSON cache."""
     try:
-        from lyrics_provider import get_cache_path
-        query = f"{artist} {title}"
-        cache_path = get_cache_path("lyrics", query)
+        cache_path = resolve_lyrics_cache_path(artist, title, duration)
         if os.path.exists(cache_path):
             with open(cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -58,6 +71,41 @@ def save_offset_to_cache(artist: str, title: str, offset: float):
             print(f"[CACHE] Saved offset {offset:.2f}s for '{title}' by '{artist}'")
     except Exception as e:
         print(f"Error saving offset to cache: {e}")
+
+def save_line_media_to_cache(artist: str, title: str, duration: float, line_index: int, media_path: str):
+    """Updates the 'media' property of a specific lyric line in the cache."""
+    try:
+        from lyrics_provider import get_cache_path
+        query = f"{artist} {title}"
+        cache_key = query
+        if duration > 0.0:
+            cache_key = f"{query}_{int(duration)}"
+            
+        cache_path = get_cache_path("lyrics", cache_key)
+        if not os.path.exists(cache_path):
+            cache_path_fallback = get_cache_path("lyrics", query)
+            if os.path.exists(cache_path_fallback):
+                cache_path = cache_path_fallback
+            else:
+                return False
+                
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+        if isinstance(data, dict) and "lyrics" in data:
+            if 0 <= line_index < len(data["lyrics"]):
+                if media_path is None:
+                    data["lyrics"][line_index].pop("media", None)
+                else:
+                    data["lyrics"][line_index]["media"] = media_path
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=4, ensure_ascii=False)
+                print(f"[CACHE] Updated media for line {line_index} of '{title}'")
+                return True
+        return False
+    except Exception as e:
+        print(f"Error saving line media to cache: {e}")
+        return False
 
 def save_edited_lyrics(artist: str, title: str, duration: float, edited_text: str) -> bool:
     """Aligns edited text lines with cached lyric structures to preserve times, and saves to cache."""
@@ -91,6 +139,17 @@ def save_edited_lyrics(artist: str, title: str, duration: float, edited_text: st
         else:
             old_lyrics = data
             data = {"offset": 0.0, "lyrics": old_lyrics}
+            
+        from lyrics_provider import parse_lrc
+        if re.search(r'\[\d+:\d+(?:\.\d+)?\]', edited_text):
+            updated_lyrics = parse_lrc(edited_text)
+            data["lyrics"] = updated_lyrics
+            if "plain_lyrics" in data:
+                del data["plain_lyrics"]
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            print(f"[CACHE] Successfully saved raw LRC edited lyrics to cache for '{title}' by '{artist}' ({len(updated_lyrics)} lines)")
+            return True
             
         new_lines = [line.strip() for line in edited_text.splitlines()]
         old_lines = [l.get("text", "").strip() for l in old_lyrics]
@@ -181,7 +240,7 @@ audio_analyzer = None
 
 async def register(websocket):
     """Registers a new WebSocket client and syncs the current state immediately."""
-    global force_sync_trigger, current_track_offset, last_track_payload
+    global force_sync_trigger, current_track_offset, last_track_payload, is_client_fullscreen
     connected_clients.add(websocket)
     print(f"Client connected. Total clients: {len(connected_clients)}")
     
@@ -210,6 +269,33 @@ async def register(websocket):
                         )
                         if success:
                             force_sync_trigger = True
+                elif data.get("action") == "set_line_media":
+                    line_index = data.get("index")
+                    media_path = data.get("media_path")
+                    print(f"WS set_line_media action received for index {line_index}")
+                    if last_track_payload and line_index is not None:
+                        success = save_line_media_to_cache(
+                            last_track_payload["artist"],
+                            last_track_payload["title"],
+                            last_track_payload.get("duration", 0.0),
+                            line_index,
+                            media_path
+                        )
+                        if success:
+                            force_sync_trigger = True
+                elif data.get("action") == "clear_line_media":
+                    line_index = data.get("index")
+                    print(f"WS clear_line_media action received for index {line_index}")
+                    if last_track_payload and line_index is not None:
+                        success = save_line_media_to_cache(
+                            last_track_payload["artist"],
+                            last_track_payload["title"],
+                            last_track_payload.get("duration", 0.0),
+                            line_index,
+                            None
+                        )
+                        if success:
+                            force_sync_trigger = True
                 elif data.get("action") == "set_offset":
                     new_offset = float(data.get("offset", 0.0))
                     current_track_offset = new_offset
@@ -220,7 +306,8 @@ async def register(websocket):
                         save_offset_to_cache(
                             last_track_payload["artist"],
                             last_track_payload["title"],
-                            new_offset
+                            new_offset,
+                            last_track_payload.get("duration", 0.0),
                         )
                     # Broadcast the offset update to all clients
                     await broadcast({"type": "offset", "offset": new_offset})
@@ -230,6 +317,14 @@ async def register(websocket):
                     enable_popups = settings.get("popups", True)
                     enable_shake = settings.get("shake", True)
                     print(f"WS Settings updated: Popups={enable_popups}, Shake={enable_shake}")
+                elif data.get("action") == "set_fullscreen":
+                    global is_client_fullscreen
+                    is_client_fullscreen = data.get("state", False)
+                    print(f"WS Fullscreen state updated: {is_client_fullscreen}")
+                    if is_client_fullscreen:
+                        close_all_popups("fullscreen_entered")
+                elif data.get("action") == "log":
+                    print(f"[FRONTEND LOG] {data.get('message')}")
             except Exception as e:
                 pass
     except Exception as e:
@@ -262,9 +357,17 @@ async def shake_windows_loop():
     global should_shake_windows, audio_analyzer
     import random
 
+    def do_moves(moves):
+        for win, x, y in moves:
+            try:
+                win.move(x, y)
+            except Exception:
+                pass
+
     while True:
         try:
-            if should_shake_windows and popup_windows:
+            moves = []
+            if should_shake_windows and enable_shake and popup_windows:
                 # Read real bass energy from the audio analyzer
                 bass = 0.0
                 if audio_analyzer and audio_analyzer.available:
@@ -275,32 +378,27 @@ async def shake_windows_loop():
                     wins = list(popup_windows)
                     for win in wins:
                         if hasattr(win, "orig_x") and hasattr(win, "orig_y"):
-                            try:
-                                base_amt = 10.0 if getattr(win, "is_ultimate_climax", False) else 5.0
-                                amt = base_amt * bass
-                                dx = (random.random() * 2 - 1) * amt
-                                dy = (random.random() * 2 - 1) * amt
-                                win.move(int(win.orig_x + dx), int(win.orig_y + dy))
-                            except Exception:
-                                pass
+                            base_amt = 10.0 if getattr(win, "is_ultimate_climax", False) else 5.0
+                            amt = base_amt * bass
+                            dx = (random.random() * 2 - 1) * amt
+                            dy = (random.random() * 2 - 1) * amt
+                            moves.append((win, int(win.orig_x + dx), int(win.orig_y + dy)))
                 else:
                     # Bass too low — restore original positions smoothly
                     wins = list(popup_windows)
                     for win in wins:
                         if hasattr(win, "orig_x") and hasattr(win, "orig_y"):
-                            try:
-                                win.move(win.orig_x, win.orig_y)
-                            except Exception:
-                                pass
+                            moves.append((win, win.orig_x, win.orig_y))
             else:
                 # Not shaking — restore original positions
                 wins = list(popup_windows)
                 for win in wins:
                     if hasattr(win, "orig_x") and hasattr(win, "orig_y"):
-                        try:
-                            win.move(win.orig_x, win.orig_y)
-                        except Exception:
-                            pass
+                        moves.append((win, win.orig_x, win.orig_y))
+                        
+            if moves:
+                await asyncio.to_thread(do_moves, moves)
+                
         except Exception:
             pass
         await asyncio.sleep(0.025)  # ~40 FPS
@@ -321,7 +419,7 @@ async def audio_broadcast_loop():
                 })
         except Exception:
             pass
-        await asyncio.sleep(0.04)  # ~25 FPS broadcast rate
+        await asyncio.sleep(0.08)  # ~12 FPS broadcast rate (frontend smooths values)
 
 def stretch_word_text(word_text: str, duration: float) -> str:
     """Stretches vowels in a word if it is sung for a long time (low characters per second),
@@ -747,7 +845,10 @@ def extract_parenthetical_words(line_text: str, words: list) -> tuple:
 def spawn_popup_window(line: dict, artist: str, title: str, target_unix_time: float, end_time: float, lyrics_data: list = None, line_index: int = -1):
     """Spawns a new popup window in a non-overlapping zone on the screen.
     If lyrics_data and line_index are provided, looks ahead for multi-line parenthetical groups."""
-    global popup_windows, popup_zone_index, active_ultimate_climax_win, last_popup_spawn_time
+    global popup_windows, popup_zone_index, active_ultimate_climax_win, last_popup_spawn_time, is_client_fullscreen
+    
+    if is_client_fullscreen:
+        return
     
     is_climax = line.get("is_ultimate_climax", False)
     
@@ -892,16 +993,20 @@ def spawn_popup_window(line: dict, artist: str, title: str, target_unix_time: fl
                 print(f"Spawning Climax window '{win_title}' at ({x}, {y})")
         except Exception:
             pass
-        win = webview.create_window(
-            title=f"🔥 {win_title}.txt" if is_climax else f"📄 {win_title}.txt",
-            html=html_content,
-            width=width,
-            height=height,
-            x=x,
-            y=y,
-            resizable=True,
-            text_select=True
-        )
+            
+        def do_create_window():
+            return webview.create_window(
+                title=f"🔥 {win_title}.txt" if is_climax else f"📄 {win_title}.txt",
+                html=html_content,
+                width=width,
+                height=height,
+                x=x,
+                y=y,
+                resizable=True,
+                text_select=True
+            )
+            
+        win = do_create_window()
         win.orig_x = x
         win.orig_y = y
         win.is_ultimate_climax = is_climax
@@ -917,10 +1022,14 @@ def safe_destroy_window(win):
     """Safely destroys a pywebview window using standard destroy."""
     if win not in webview.windows:
         return
-    try:
-        win.destroy()
-    except Exception:
-        pass
+    def do_destroy():
+        try:
+            win.destroy()
+        except Exception:
+            pass
+    # We can just call it directly as destroy() handles threading gracefully in pywebview
+    # but to be safe we can use a thread
+    threading.Thread(target=do_destroy, daemon=True).start()
 
 def close_all_popups(reason="unknown"):
     """Destroys all open popup windows immediately."""
@@ -962,13 +1071,38 @@ async def monitor_media():
     
     lyrics_load_task = None
     consecutive_none_reads = 0
-    consecutive_paused_reads = 0
     last_full_fetch_time = 0.0
 
     async def fetch_and_process_track_details(target_title, target_artist, target_source, target_duration):
         nonlocal lyrics_data, song_bpm, song_energy, song_valence
         global last_track_payload, last_position_payload, current_track_offset, current_song_bpm, current_song_energy
+        
+        async def download_and_notify_cover():
+            success = await cover_manager.download_cover(target_artist, target_title)
+            if success:
+                import base64
+                try:
+                    with open(cover_manager.cover_path, "rb") as f:
+                        b64_data = base64.b64encode(f.read()).decode('utf-8')
+                    print(f"Broadcasting base64 cover image to frontend ({len(b64_data)} bytes)")
+                    await broadcast({
+                        "type": "cover_ready", 
+                        "base64": f"data:image/jpeg;base64,{b64_data}"
+                    })
+                except Exception as e:
+                    print(f"Error encoding cover: {e}")
+
         try:
+            # Trigger background download of album cover
+            asyncio.create_task(download_and_notify_cover())
+            
+            # Broadcast loading state immediately to the client
+            await broadcast({
+                "type": "lyrics_loading",
+                "title": target_title,
+                "artist": target_artist
+            })
+            
             # 1. Fetch synced lyrics dictionary (offload to thread pool with a timeout of 5.0 seconds)
             try:
                 lyrics_dict = await asyncio.wait_for(
@@ -979,14 +1113,15 @@ async def monitor_media():
                         artist=target_artist, 
                         title=target_title
                     ),
-                    timeout=15.0
+                    timeout=25.0
                 )
             except asyncio.TimeoutError:
-                print(f"Lyrics fetch timed out after 15.0s for: '{target_title}' by '{target_artist}'")
+                print(f"Lyrics fetch timed out after 25.0s for: '{target_title}' by '{target_artist}'")
                 lyrics_dict = {"offset": 0.0, "lyrics": []}
                 
             raw_lyrics = lyrics_dict.get("lyrics", [])
             track_offset = lyrics_dict.get("offset", 0.0)
+            current_track_offset = track_offset
             
             # 2. Analyze lyrics metrics (offload to thread pool)
             h_bpm, h_energy, h_valence = await asyncio.to_thread(
@@ -1013,8 +1148,9 @@ async def monitor_media():
                 # Calculate a realistic duration of the line to prevent typing/stretching trailing over instrumental gaps
                 gap_to_next = next_time - line["time"]
                 text_words = line["text"].split()
-                # Use a more generous estimation to preserve the word-stretching effect (approx 0.7s per word + 1.5s)
-                estimated_dur = len(text_words) * 0.7 + 1.5
+                # Use a tighter estimation (approx 0.35s per word + 0.8s) to type slightly faster than the singer.
+                # This prevents the "falling behind" effect when the singer finishes a sentence quickly.
+                estimated_dur = len(text_words) * 0.35 + 0.8
                 
                 # If the line already has word timestamps, ensure line_duration covers all of them
                 pre_words = line.get("words", [])
@@ -1208,6 +1344,8 @@ async def monitor_media():
             print(f"Error in lyrics loading task: {e}")
             traceback.print_exc()
 
+    last_audio_active_time = 0.0
+    last_periodic_broadcast = 0.0
     while True:
         try:
             # Check for force sync trigger
@@ -1271,15 +1409,28 @@ async def monitor_media():
             if track_info:
                 consecutive_none_reads = 0
                 title = track_info["title"]
-                artist = track_info["artist"]
+                raw_artist = track_info["artist"]
+                
+                # Sanitize artist string: take only the primary artist before commas, &, or "feat"
+                artist = re.split(r',|&| feat\. | ft\. | x | \+ ', raw_artist, flags=re.IGNORECASE)[0].strip() if raw_artist else ""
                 position = track_info["position"]
                 is_paused = track_info["is_paused"]
                 source = track_info["source_app"]
                 
+                # --- BUGFIX: GSMTC Spotify Bug Override ---
+                # Sometimes Spotify reports paused while actually playing.
+                # Only override if there's REAL-TIME evidence the song is playing.
+                # When user genuinely pauses: audio stops + position freezes → override doesn't fire → lyrics stop instantly.
+                if is_paused:
+                    audio_active = audio_analyzer and audio_analyzer.available and audio_analyzer.get_bass_energy() > 0.002
+                    position_advancing = (last_raw_position is not None) and (position > last_raw_position + 0.1)
+                    
+                    if audio_active or position_advancing:
+                        is_paused = False
+                
                 # Update extrapolated local position
                 current_time = time.time()
-                is_transient_zero = False  # Will be set to True if 0.0 glitch detected in same-track branch
-                is_seeking = False         # Initialize to prevent UnboundLocalError
+                is_seeking = False
                 # Only trigger track change if the metadata is valid and not transient "Unknown" placeholder
                 is_valid_track = title not in ("Unknown Title", "Unknown", "") and artist not in ("Unknown Artist", "Unknown", "")
                 if is_valid_track and (title != last_title or artist != last_artist):
@@ -1301,17 +1452,18 @@ async def monitor_media():
                     
                     # Force close all climax popups on track change
                     close_all_popups("track_change")
+                    cover_manager.delete_cover()
                     if popup_close_task:
                         popup_close_task.cancel()
                         popup_close_task = None
                     spawned_climax_times.clear()
                     last_popup_spawn_time = 0.0
                     
+                    duration = track_info.get("duration", 0.0)
+                    
                     # Load cached offset immediately to prevent sync lag in early seconds
-                    from lyrics_provider import get_cache_path
-                    query = f"{artist} {title}"
-                    cache_path = get_cache_path("lyrics", query)
                     current_track_offset = 0.0
+                    cache_path = resolve_lyrics_cache_path(artist, title, duration)
                     if os.path.exists(cache_path):
                         try:
                             with open(cache_path, "r", encoding="utf-8") as f:
@@ -1327,7 +1479,6 @@ async def monitor_media():
                     song_energy = 0.5
                     song_valence = 0.5
                     
-                    duration = track_info.get("duration", 0.0)
                     # Build and broadcast initial empty track payload
                     last_track_payload = {
                         "type": "track",
@@ -1393,7 +1544,15 @@ async def monitor_media():
                     local_position = position
                     last_raw_position = position
                     last_clock_time = current_time
-                    
+                
+                # Broadcast position on seek, state change, or periodically every 5s for correction
+                needs_broadcast = is_seeking or state_changed
+                if not needs_broadcast:
+                    if current_time - last_periodic_broadcast >= 5.0:
+                        needs_broadcast = True
+                
+                if needs_broadcast:
+                    last_periodic_broadcast = current_time
                     broadcast_position = local_position
                     last_position_payload = {
                         "type": "position",
@@ -1402,7 +1561,7 @@ async def monitor_media():
                     }
                     await broadcast(last_position_payload)
                 
-                # Autoritative tracking state update on every tick (prevents GSMTC overload)
+                # Autoritative tracking state update on every tick
                 last_position = position
                 last_is_paused = is_paused
                 
@@ -1437,7 +1596,7 @@ async def monitor_media():
                 
                 # Dynamically set desktop window shaking based on active intensity
                 if active_line_index >= 0:
-                    should_shake_windows = (lyrics_data[active_line_index]["intensity"]["level"] == 3) and not is_paused
+                    should_shake_windows = enable_shake and (lyrics_data[active_line_index]["intensity"]["level"] == 3) and not is_paused
                 else:
                     should_shake_windows = False
                     
@@ -1492,7 +1651,15 @@ async def monitor_media():
                                     end_time = line["time"] + line_duration
                                     
                                     if enable_popups:
-                                        spawn_popup_window(line, artist, title, target_unix_time, end_time, lyrics_data, idx)
+                                        spawn_popup_window(
+                                            line,
+                                            last_artist,
+                                            last_title,
+                                            target_unix_time,
+                                            end_time,
+                                            lyrics_data,
+                                            idx,
+                                        )
                 
                 # Trigger climax window spawning on line changes (fallback if not pre-spawned)
                 if active_line_index != current_line_index:
@@ -1523,7 +1690,15 @@ async def monitor_media():
                                 end_time = active_line["time"] + line_duration
                                 
                                 if enable_popups:
-                                    spawn_popup_window(active_line, artist, title, time.time(), end_time, lyrics_data, active_line_index)
+                                    spawn_popup_window(
+                                        active_line,
+                                        last_artist,
+                                        last_title,
+                                        time.time(),
+                                        end_time,
+                                        lyrics_data,
+                                        active_line_index,
+                                    )
                         else:
                             # If we drop below level 3, schedule auto-destroy of all popups after 5 seconds of calm
                             if popup_windows and popup_close_task is None:
@@ -1549,8 +1724,9 @@ async def monitor_media():
                         last_artist = None
                         current_line_index = -1
                         
-                        # Force close popups
+                        # Force close popups and cleanup cover
                         close_all_popups("idle_no_track")
+                        cover_manager.delete_cover()
                         if popup_close_task:
                             popup_close_task.cancel()
                             popup_close_task = None
@@ -1598,7 +1774,7 @@ async def main_async():
     
     bpm_provider = BPMProvider()
     
-    # Start real-time audio analyzer (WASAPI loopback capture)
+    # Start real-time audio analyzer (PyCaw session peak monitoring)
     audio_analyzer = AudioAnalyzer()
     audio_analyzer.start()
     
@@ -1636,6 +1812,27 @@ def create_default_config():
         except Exception as e:
             pass
 
+import http.server
+import socketserver
+import urllib.parse
+
+class LocalMediaHandler(http.server.SimpleHTTPRequestHandler):
+    def translate_path(self, path):
+        parsed = urllib.parse.urlparse(path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if 'path' in qs:
+            return qs['path'][0]
+        return ""
+
+def start_media_server():
+    try:
+        Handler = LocalMediaHandler
+        httpd = socketserver.TCPServer(("127.0.0.1", 8766), Handler)
+        print("[MEDIA SERVER] Serving local media on port 8766")
+        httpd.serve_forever()
+    except Exception as e:
+        print(f"[MEDIA SERVER] Failed to start: {e}")
+
 if __name__ == "__main__":
     create_default_config()
     
@@ -1643,6 +1840,10 @@ if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     server_thread = threading.Thread(target=run_async_server, args=(loop,), daemon=True)
     server_thread.start()
+    
+    # Start Media Server thread
+    media_server_thread = threading.Thread(target=start_media_server, daemon=True)
+    media_server_thread.start()
     
     # 2. Start Desktop UI Window
     print("Launching Lyrics Notepad UI...")
@@ -1653,18 +1854,41 @@ if __name__ == "__main__":
     except AttributeError:
         base_path = os.path.abspath(".")
         
-    html_path = os.path.join(base_path, "web", "index_v2.html")
+    html_path = os.path.join(base_path, "web", "index.html")
     if not os.path.exists(html_path):
         print(f"Error: HTML assets not found at {html_path}", file=sys.stderr)
         sys.exit(1)
         
+    class Api:
+        def toggle_fullscreen(self):
+            try:
+                webview.windows[0].toggle_fullscreen()
+            except Exception as e:
+                print(f"Error toggling fullscreen: {e}")
+                
+        def pick_media_file(self):
+            try:
+                import webview
+                file_types = ('Media Files (*.mp4;*.webm;*.jpg;*.png;*.jpeg;*.gif)', 'All files (*.*)')
+                result = webview.windows[0].create_file_dialog(
+                    webview.OPEN_DIALOG, allow_multiple=False, file_types=file_types
+                )
+                if result:
+                    # Windows paths have backslashes, let's normalize to forward slashes for URLs
+                    return result[0].replace('\\', '/')
+                return None
+            except Exception as e:
+                print(f"Error picking media file: {e}")
+                return None
+
     window = webview.create_window(
-        title="Untitled - Notepad", 
+        title="Untitled - LyricPad", 
         url=html_path, 
         width=850, 
         height=600, 
         resizable=True,
-        text_select=True
+        text_select=True,
+        js_api=Api()
     )
     
     # Start pywebview window loop (blocks until closed)

@@ -1,9 +1,8 @@
 """
-Real-time Audio Analyzer — WASAPI Loopback Bass/Kick Detection
-With targeted application audio session isolation using pycaw.
+Real-time Audio Analyzer — PyCaw session peak monitoring for bass/kick detection.
 
-Captures system audio output and filters out sound from unwanted applications
-(like Discord, system alerts, etc.) by validating the active music source volume.
+Measures per-application audio peak levels via Windows Core Audio API (pycaw),
+isolating the active music player from other system sounds.
 """
 
 import threading
@@ -16,7 +15,7 @@ import sys
 if not hasattr(sys, 'coinit_flags'):
     sys.coinit_flags = 0  # COINIT_MULTITHREADED
 
-# Suppress annoying soundcard discontinuity warnings that pollute the console
+# Suppress comtypes warnings that pollute the console
 
 warnings.filterwarnings("ignore", message="data discontinuity in recording")
 
@@ -96,16 +95,27 @@ class AudioAnalyzer:
 
     def _get_target_session_peak(self, pycaw_utilities, target_keyword):
         """Finds target audio session and queries its current peak volume level."""
-        try:
-            sessions = pycaw_utilities.AudioUtilities.GetAllSessions()
-            for session in sessions:
-                if session.Process and target_keyword in session.Process.name().lower():
-                    # Return target application's active volume level (0.0 to 1.0)
-                    meter = session.AudioMeterInformation
-                    if meter:
-                        return meter.GetPeakValue()
-        except Exception:
-            pass
+        # Find and cache the meter if we don't have it, or check every 2 seconds
+        now = time.time()
+        if not hasattr(self, '_cached_meter') or self._cached_meter is None or (now - getattr(self, '_last_session_check', 0)) > 2.0:
+            self._last_session_check = now
+            self._cached_meter = None
+            try:
+                sessions = pycaw_utilities.AudioUtilities.GetAllSessions()
+                for session in sessions:
+                    if session.Process and target_keyword in session.Process.name().lower():
+                        if session.AudioMeterInformation:
+                            self._cached_meter = session.AudioMeterInformation
+                            break
+            except Exception:
+                pass
+                
+        if self._cached_meter:
+            try:
+                return self._cached_meter.GetPeakValue()
+            except Exception:
+                self._cached_meter = None # In case the session dies
+                return None
         return None
 
     def _capture_loop(self):
@@ -119,6 +129,8 @@ class AudioAnalyzer:
 
         print(f"[AudioAnalyzer] Starting pycaw application-isolated audio peak monitoring.")
         self._available = True
+        self._cached_meter = None
+        self._last_session_check = 0
 
         try:
             while self._running:
