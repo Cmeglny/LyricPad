@@ -3,12 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <title>⚡ CLIMAX</title>
-    <link rel="stylesheet" href="style_v2.css">
-    <link href="https://fonts.googleapis.com/css2?family=Segoe+UI:wght@400;600&family=Consolas&family=Courier+Prime:wght@400;700&display=swap" rel="stylesheet">
+    <link id="main-css" rel="stylesheet" href="style.css?v=5">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
-        /* Climax Window Specific overrides to ensure 100% legibility and deep contrast */
         body {
-            background-color: #070913 !important;
+            background-color: #0f0f11;
             margin: 0;
             padding: 0;
             overflow: hidden;
@@ -18,49 +17,44 @@
             height: 100vh;
             width: 100vw;
         }
-        .notepad-window {
-            width: 100vw;
-            height: 100vh;
-            border-color: #a282f9 !important;
-            animation: pulse-beat-dramatic var(--beat-duration, 0.5s) infinite ease-in-out !important;
-            background-color: #000000 !important;
+        .main-content {
+            padding: 40px;
         }
-        .editor-container {
-            background-color: #000000 !important;
+        .lyrics-display {
+            justify-content: center;
+            align-items: center;
         }
-        .notepad-textarea {
-            color: #ffffff !important;
-            font-size: 20px !important;
-            font-weight: bold !important;
-            text-transform: uppercase !important;
-            text-shadow: 0 0 10px rgba(162, 130, 249, 0.8) !important;
-            line-height: 1.5 !important;
-            padding: 15px !important;
+        .lyrics-history {
+            position: static;
+            margin-bottom: 20px;
+            text-align: center;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
         }
-        .cursor {
-            color: #a282f9 !important;
+        .current-line {
+            font-size: 5vw;
+            text-align: center;
         }
     </style>
 </head>
 <body class="theme-dramatic">
-    <div id="notepad-window" class="notepad-window">
-        <!-- Minimal Title Bar -->
-        <div class="title-bar" style="background-color: #090b16 !important; border-bottom-color: #a282f9 !important; height: 35px;">
-            <div class="tabs-container" style="height: 28px;">
-                <div class="tab active" style="background-color: #000000 !important; border-color: #a282f9 !important; color: #ffffff !important; height: 26px;">
-                    <span class="tab-icon">⚡</span>
-                    <span class="tab-title" style="color: #a282f9; font-weight: 600;">Climax.txt</span>
+    <!-- Dynamic Ambient Background -->
+    <div id="app-background" class="app-background"></div>
+    <div id="glass-overlay" class="glass-overlay"></div>
+
+    <div id="app-container" class="app-container" style="width: 100%; height: 100%;">
+        <main class="main-content">
+            <div class="editor-container" id="editor-container" style="max-width: 100%; border: none; box-shadow: none; background: transparent; backdrop-filter: none;">
+                <div class="glitch-overlay" id="glitch-overlay"></div>
+                <div class="lyrics-display" id="lyrics-display">
+                    <div class="lyrics-history" id="lyrics-history"></div>
+                    <div class="current-line climax-text" id="current-line-span"></div>
                 </div>
             </div>
-        </div>
-        
-        <!-- Editor Content -->
-        <div class="editor-container">
-            <div class="glitch-overlay" style="display: block;"></div>
-            <div class="notepad-textarea" id="notepad-textarea"><span class="lyrics-history" id="lyrics-history"></span><span class="current-word-container" id="current-line-span"></span><span class="cursor" id="cursor">|</span></div>
-        </div>
+        </main>
     </div>
 
-    <script src="climax.js"></script>
+    <script src="climax.js?v=5"></script>
 </body>
 </html>

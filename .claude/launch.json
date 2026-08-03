@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "atakent",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "8099",
+        "--directory",
+        "C:/Users/cemuu/.gemini/antigravity-ide/scratch/atakent-ambulans"
+      ],
+      "port": 8099
+    }
+  ]
+}

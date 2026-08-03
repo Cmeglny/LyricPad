@@ -6,11 +6,14 @@ let currentIndex = -1;
 let localTime = 0.0;
 let lastFrameTime = performance.now();
 let isPaused = true;
+let currentTrack = null;
 
 const lyricsHistory = document.getElementById('lyrics-history');
 const currentLineSpan = document.getElementById('current-line-span');
-const textarea = document.getElementById('notepad-textarea');
-const notepadWindow = document.getElementById('notepad-window');
+const appBg = document.getElementById('app-background');
+
+let wordNodes = [];
+let climaxHistoryText = [];
 
 function connectWebSocket() {
     socket = new WebSocket("ws://localhost:8765");
@@ -27,11 +30,16 @@ function connectWebSocket() {
     socket.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         if (msg.type === "track") {
+            currentTrack = msg;
             lyrics = msg.lyrics || [];
             currentIndex = -1;
-            climaxHistoryText = "";
-            lyricsHistory.innerText = "";
-            currentLineSpan.innerText = "";
+            climaxHistoryText = [];
+            lyricsHistory.innerHTML = "";
+            currentLineSpan.innerHTML = "";
+            wordNodes = [];
+            
+        } else if (msg.type === "cover_ready") {
+            loadCoverColor(msg.base64);
         } else if (msg.type === "position") {
             const timeDiff = Math.abs(msg.position - localTime);
             if (msg.is_paused !== isPaused || timeDiff > 2.0 || msg.position === 0.0) {
@@ -40,10 +48,35 @@ function connectWebSocket() {
                 lastFrameTime = performance.now();
                 
                 checkLyricsSync(localTime);
-                renderCurrentLine(localTime);
+                updateWordHighlights(localTime);
             }
         }
     };
+}
+
+function loadCoverColor(base64Data) {
+    const img = new Image();
+    img.onload = () => {
+        try {
+            const canvas = document.createElement("canvas");
+            const ctx = canvas.getContext("2d", { willReadFrequently: true });
+            canvas.width = 1;
+            canvas.height = 1;
+            
+            ctx.drawImage(img, 0, 0, 1, 1);
+            const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
+            
+            document.documentElement.style.setProperty('--fs-color-rgb', `${r}, ${g}, ${b}`);
+            document.documentElement.style.setProperty('--fs-color-core', `rgb(${r}, ${g}, ${b})`);
+            
+            if (appBg) {
+                appBg.style.backgroundImage = `url('${base64Data}')`;
+            }
+        } catch (e) {
+            console.error(e);
+        }
+    };
+    img.src = base64Data;
 }
 
 // 60 FPS Clock loop
@@ -53,7 +86,7 @@ function clockTick(now) {
         localTime += delta;
         
         checkLyricsSync(localTime);
-        renderCurrentLine(localTime);
+        updateWordHighlights(localTime);
     }
     lastFrameTime = now;
     requestAnimationFrame(clockTick);
@@ -77,81 +110,119 @@ function checkLyricsSync(time) {
     }
 }
 
-let climaxHistoryText = "";
-
 function handleActiveLineChange(activeLineIndex) {
     if (activeLineIndex === -1) {
-        climaxHistoryText = "";
-        lyricsHistory.innerText = "";
-        currentLineSpan.innerText = "";
+        climaxHistoryText = [];
+        lyricsHistory.innerHTML = "";
+        currentLineSpan.innerHTML = "";
+        wordNodes = [];
         currentIndex = -1;
-    } else if (activeLineIndex < currentIndex || activeLineIndex - currentIndex > 1) {
-        // Major jump (user seeked backward or forward manually)
-        climaxHistoryText = "";
-        for (let i = 0; i <= activeLineIndex - 1; i++) {
-            const line = lyrics[i];
-            const intensity = line.intensity || { level: 1 };
-            if (intensity.level === 3 && line.text.trim() !== "") {
-                climaxHistoryText += line.text.trim().toUpperCase() + "\n";
-            }
-        }
-        currentIndex = activeLineIndex;
-        lyricsHistory.innerText = climaxHistoryText;
-    } else {
-        // Normal sequential progression
-        if (currentIndex >= 0) {
-            const prevLine = lyrics[currentIndex];
-            const prevIntensity = prevLine.intensity || { level: 1 };
-            if (prevIntensity.level === 3 && prevLine.text.trim() !== "") {
-                climaxHistoryText += prevLine.text.trim().toUpperCase() + "\n";
-            }
-        }
-        
-        currentIndex = activeLineIndex;
-        lyricsHistory.innerText = climaxHistoryText;
-    }
-    textarea.scrollTop = textarea.scrollHeight;
-}
-
-function renderCurrentLine(time) {
-    if (currentIndex < 0 || currentIndex >= lyrics.length) {
-        currentLineSpan.innerText = "";
         return;
-    }
-    
-    const line = lyrics[currentIndex];
+    } 
+
+    const line = lyrics[activeLineIndex];
     const intensity = line.intensity || { level: 1, is_caps: false };
+    const isCaps = intensity.is_caps || intensity.level === 3;
+    
+    // Add previous line to history if it was climax level
+    if (currentIndex >= 0 && currentIndex !== activeLineIndex && currentIndex < lyrics.length) {
+        const prevLine = lyrics[currentIndex];
+        const prevIntensity = prevLine.intensity || { level: 1 };
+        if (prevIntensity.level === 3 && prevLine.text.trim() !== "") {
+            let histText = prevLine.text.trim();
+            if (prevIntensity.is_caps || prevIntensity.level === 3) histText = histText.toUpperCase();
+            climaxHistoryText.push(histText);
+            
+            // Keep only last 3 history lines for climax
+            if (climaxHistoryText.length > 3) {
+                climaxHistoryText.shift();
+            }
+        }
+    } else if (activeLineIndex < currentIndex || activeLineIndex - currentIndex > 1) {
+        // Jumped timeline, rebuild history
+        climaxHistoryText = [];
+        for (let i = Math.max(0, activeLineIndex - 5); i < activeLineIndex; i++) {
+            const l = lyrics[i];
+            const iLevel = l.intensity || { level: 1 };
+            if (iLevel.level === 3 && l.text.trim() !== "") {
+                let histText = l.text.trim();
+                if (iLevel.is_caps || iLevel.level === 3) histText = histText.toUpperCase();
+                climaxHistoryText.push(histText);
+            }
+        }
+        if (climaxHistoryText.length > 3) {
+            climaxHistoryText = climaxHistoryText.slice(-3);
+        }
+    }
+
+    currentIndex = activeLineIndex;
+    
+    // Render History
+    lyricsHistory.innerHTML = '';
+    climaxHistoryText.forEach(text => {
+        const lineDiv = document.createElement('div');
+        lineDiv.className = 'history-line';
+        lineDiv.textContent = text;
+        lyricsHistory.appendChild(lineDiv);
+    });
     
     // Climax window ONLY displays level 3 (Dramatic) lyrics in the active zone
+    currentLineSpan.innerHTML = "";
+    wordNodes = [];
+    
     if (intensity.level !== 3) {
-        currentLineSpan.innerText = "";
         return;
     }
     
+    // Render Current Line with typewriter effect
     if (!line.words || line.words.length === 0) {
         let text = line.text.trim();
-        if (intensity.is_caps) text = text.toUpperCase();
-        currentLineSpan.innerText = text;
+        if (isCaps) text = text.toUpperCase();
+        currentLineSpan.textContent = text;
         return;
     }
     
-    let lineHTML = "";
     for (let i = 0; i < line.words.length; i++) {
         const w = line.words[i];
-        if (time < w.time) {
-            break; // Word has not started yet
+        let wt = w.text;
+        if (isCaps) wt = wt.toUpperCase();
+
+        // Calculate dynamic fill duration
+        let duration = 0.3;
+        if (i < line.words.length - 1) {
+            duration = line.words[i+1].time - w.time;
+        } else if (i > 0) {
+            duration = Math.min(1.5, w.time - line.words[i-1].time);
         }
+        duration = Math.max(0.1, Math.min(duration, 1.5));
+        const transitionStyle = `background-position ${duration.toFixed(2)}s linear`;
+
+        const span = document.createElement('span');
+        span.className = 'lyric-char';
+        span.style.transition = transitionStyle;
+        span.textContent = wt;
+        currentLineSpan.appendChild(span);
         
-        let wordText = w.text;
-        if (intensity.is_caps) {
-            wordText = wordText.toUpperCase();
-        }
-        
-        lineHTML += wordText;
+        wordNodes.push({
+            el: span,
+            time: w.time,
+            active: false
+        });
     }
-    
-    // Trim leading whitespace during formatting
-    currentLineSpan.innerText = lineHTML.replace(/^\s+/, "");
+}
+
+function updateWordHighlights(time) {
+    if (currentIndex === -1 || wordNodes.length === 0) return;
+
+    for (let i = 0; i < wordNodes.length; i++) {
+        const wNode = wordNodes[i];
+        const isActive = time >= wNode.time;
+        
+        if (wNode.active !== isActive) {
+            wNode.active = isActive;
+            wNode.el.className = isActive ? 'lyric-char active' : 'lyric-char';
+        }
+    }
 }
 
 // Start connection

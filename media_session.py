@@ -39,7 +39,8 @@ class MediaSessionTracker:
                 
             title = props.title or "Unknown Title"
             artist = props.artist or "Unknown Artist"
-            
+            album = props.album_title or ""
+
             # Duration and Position
             duration = timeline.end_time.total_seconds() if timeline and timeline.end_time else 0.0
             position = timeline.position.total_seconds() if timeline and timeline.position else 0.0
@@ -54,6 +55,7 @@ class MediaSessionTracker:
             return {
                 "title": title,
                 "artist": artist,
+                "album": album,
                 "duration": duration,
                 "position": position,
                 "is_paused": is_paused,
@@ -61,6 +63,59 @@ class MediaSessionTracker:
             }
         except Exception as e:
             print(f"Error reading track info: {e}")
+            return None
+
+    async def send_control(self, command: str) -> bool:
+        """Sends a playback control command to the active media session."""
+        session = self.get_current_session()
+        if not session:
+            return False
+        try:
+            if command == "playpause":
+                return await session.try_toggle_play_pause_async()
+            if command == "next":
+                return await session.try_skip_next_async()
+            if command == "previous":
+                return await session.try_skip_previous_async()
+        except Exception as e:
+            print(f"Error sending media control '{command}': {e}")
+        return False
+
+    async def seek_to(self, position_seconds: float) -> bool:
+        """Seeks the active media session to the given position (if the player allows it)."""
+        session = self.get_current_session()
+        if not session:
+            return False
+        try:
+            ticks = int(position_seconds * 10_000_000)  # 100ns units
+            return await session.try_change_playback_position_async(ticks)
+        except Exception as e:
+            print(f"Error seeking to {position_seconds:.1f}s: {e}")
+            return False
+
+    async def get_thumbnail_bytes(self, expected_title: str = None):
+        """Reads the current session's thumbnail (the exact artwork the player shows) into bytes.
+        Returns None if unavailable, or if the session's title no longer matches expected_title
+        (guards against reading the previous track's stale artwork)."""
+        session = self.get_current_session()
+        if not session:
+            return None
+        try:
+            props = await session.try_get_media_properties_async()
+            if not props or not props.thumbnail:
+                return None
+            if expected_title and (props.title or "") != expected_title:
+                return None
+            stream = await props.thumbnail.open_read_async()
+            if not stream or stream.size == 0:
+                return None
+            from winrt.windows.storage.streams import DataReader
+            reader = DataReader(stream)
+            await reader.load_async(stream.size)
+            buffer = reader.read_buffer(stream.size)
+            return bytes(buffer)
+        except Exception as e:
+            print(f"Error reading media thumbnail: {e}")
             return None
 
     def get_current_position(self) -> Optional[Dict]:

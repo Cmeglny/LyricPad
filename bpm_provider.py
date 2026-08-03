@@ -9,6 +9,7 @@ class BPMProvider:
         self.config_path = config_path
         self.spotify_creds = self.load_config()
         self.spotify_token = None
+        self.spotify_api_disabled = False
 
     def load_config(self) -> Dict:
         """Loads client_id and client_secret if present in config.json."""
@@ -45,29 +46,40 @@ class BPMProvider:
             print(f"Spotify authentication failed: {e}")
         return False
 
-    def fetch_spotify_audio_features(self, title: str, artist: str) -> Tuple[float, float, float]:
+    def fetch_spotify_audio_features(self, title: str, artist: str) -> Tuple[float, float, float, bool]:
         """
-        Fetches (tempo, energy, valence) from Spotify API. Checks disk cache first.
-        Returns (120.0, 0.5, 0.5) as fallback.
+        Fetches (tempo, energy, valence, valid) from Spotify API. Checks disk cache first.
+        'valid' is False when the values are the (120.0, 0.5, 0.5) fallback rather than real API data.
         """
         from lyrics_provider import get_cache_path
-        
+
         key = f"{artist}_{title}"
         cache_path = get_cache_path("spotify", key)
         if os.path.exists(cache_path):
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     cached = json.load(f)
+                    valid = cached.get("valid")
+                    if valid is None:
+                        # Old cache format without 'valid': the exact fallback triple means a cached failure
+                        valid = not (
+                            float(cached["bpm"]) == 120.0
+                            and float(cached["energy"]) == 0.5
+                            and float(cached["valence"]) == 0.5
+                        )
                     print(f"[CACHE HIT] Loaded Spotify features from cache for: '{title}' by '{artist}' (BPM={cached['bpm']:.1f})")
-                    return float(cached["bpm"]), float(cached["energy"]), float(cached["valence"])
+                    return float(cached["bpm"]), float(cached["energy"]), float(cached["valence"]), bool(valid)
             except Exception as e:
                 print(f"Failed to read Spotify cache: {e}")
 
         # Core logic: if we don't have creds or auth fails, we should cache the fallback (120.0, 0.5, 0.5)
         # to avoid repeated auth/connection attempts for this track.
         bpm, energy, valence = 120.0, 0.5, 0.5
+        valid = False
 
-        if self.spotify_creds and (self.spotify_token or self.get_spotify_token()):
+        if self.spotify_api_disabled:
+            pass  # Spotify Audio Features API deprecated (403), skip
+        elif self.spotify_creds and (self.spotify_token or self.get_spotify_token()):
             try:
                 # Step 1: Search for the track
                 search_url = "https://api.spotify.com/v1/search"
@@ -98,18 +110,22 @@ class BPMProvider:
                             bpm = float(feat.get("tempo", 120.0))
                             energy = float(feat.get("energy", 0.5))
                             valence = float(feat.get("valence", 0.5))
+                            valid = True
                             print(f"Spotify Audio Features loaded: BPM={bpm:.1f}, Energy={energy:.2f}, Valence={valence:.2f}")
+                        elif res_features.status_code == 403:
+                            print(f"[SPOTIFY] Audio Features API returned 403 (deprecated). Disabling future API calls.")
+                            self.spotify_api_disabled = True
             except Exception as e:
                 print(f"Failed to fetch Spotify audio features: {e}")
 
         # Cache the result (whether loaded from Spotify or fallback)
         try:
             with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump({"bpm": bpm, "energy": energy, "valence": valence}, f, indent=4)
+                json.dump({"bpm": bpm, "energy": energy, "valence": valence, "valid": valid}, f, indent=4)
         except Exception as e:
             print(f"Failed to write Spotify cache: {e}")
 
-        return bpm, energy, valence
+        return bpm, energy, valence, valid
 
     def analyze_lyrics_metrics(self, lyrics: List[Dict]) -> Tuple[float, float, float]:
         """
@@ -152,8 +168,10 @@ class BPMProvider:
         if total_time <= 0:
             total_time = 30.0
         overall_cpm = total_chars / total_time
-        
-        estimated_energy = max(0.1, min(0.95, overall_cpm / 10.0))
+
+        # Lyric density alone overrates slow, wordy ballads — weight by tempo as well
+        tempo_factor = min(1.2, estimated_bpm / 120.0)
+        estimated_energy = max(0.1, min(0.95, (overall_cpm / 10.0) * tempo_factor))
 
         # Valence (default to neutral 0.5, modified slightly by key words)
         estimated_valence = 0.5
@@ -175,7 +193,7 @@ class BPMProvider:
         print(f"Lyrics Heuristic Analysis: Estimated BPM={estimated_bpm:.1f}, Energy={estimated_energy:.2f}, Valence={estimated_valence:.2f}")
         return estimated_bpm, estimated_energy, estimated_valence
 
-    def get_line_intensity(self, current_line: Dict, next_line: Dict, song_bpm: float) -> Dict:
+    def get_line_intensity(self, current_line: Dict, next_line: Dict, song_bpm: float, song_energy: float = 0.5) -> Dict:
         """
         Calculates local properties for the current lyric line:
         - speed: factor for text typing (words per second / density)
@@ -196,8 +214,8 @@ class BPMProvider:
         
         # Detect elongated vowels in the ORIGINAL text (e.g. "meeeee", "NOOOOO", "whyyy")
         # This is a very strong climax signal since lyric sources encode intensity this way
-        elongated_vowel = bool(re.search(r'([aeiouAEIOU])\1{2,}', text))
-        elongated_consonant = bool(re.search(r'([a-zA-Z])\1{3,}', text))
+        elongated_vowel = bool(re.search(r'([aeıioöuüAEIİOÖUÜ])\1{2,}', text))
+        elongated_consonant = bool(re.search(r'([a-zA-ZçğşÇĞŞ])\1{3,}', text))
         has_elongation = elongated_vowel or elongated_consonant
         
         # Word density
@@ -212,58 +230,62 @@ class BPMProvider:
         norm_text = re.sub(r'[^a-z0-9\s]', '', text.lower()).strip()
         is_repeated_chorus = norm_text in self.repeated_lyrics if hasattr(self, 'repeated_lyrics') else False
         
-        # High intensity and emotional keyword matching
-        intensity_words = [
+        # High intensity keyword matching. Split into STRONG (aggressive/explosive words
+        # that genuinely signal intensity) and WEAK (emotional words that only count in
+        # combination). Ultra-common words like "me/you/love/heart" were removed entirely —
+        # they appear in every ballad and made calm songs read as energetic.
+        strong_words = [
             # Raw energy / aggression
-            "scream", "shout", "fire", "burn", "die", "blood", "kill", "fear", "mad", "crazy", 
-            "hate", "war", "run", "fast", "boom", "loud", "rock", "hell", "break", "fight",
+            "scream", "shout", "fire", "burn", "die", "blood", "kill", "fear", "mad", "crazy",
+            "hate", "war", "boom", "loud", "hell", "fight", "explode", "rage",
             # Turkish
-            "bağır", "çığlık", "ateş", "yan", "öl", "kan", "vur", "kork", "delir", "nefret", 
-            "savaş", "koş", "hızlı", "güm", "patla", "çıldır",
-            # Emotional climax keywords
-            "down", "hanging", "crushed", "ground", "smashed", "devastated", "collapse",
-            "useless", "empty", "pain", "tears", "broken", "fall", "lost", "fail", "let", "never",
-            "always", "wrong", "hurt", "sad", "dark", "cry", "away", "silent", "hold",
-            # Turkish emotional
-            "yık", "çök", "acı", "üzgün", "hata", "kayıp", "bırak", "git", "karanlık", "kırık",
-            # Ballad / Climax
-            "winner", "loser", "takes", "victory", "destiny", "rules", "judges", "heart", "love",
-            "all", "small", "fate", "game", "play", "strong", "weak", "tell", "show",
-            # Personal/emotional appeal (climax moments often use these)
-            "me", "you", "us", "we", "mine", "yours", "why", "what", "how",
-            "need", "want", "feel", "please", "stop", "go", "take", "give",
-            "free", "alive", "enough", "anymore", "sorry", "believe", "nobody", "everybody",
-            "nothing", "everything", "forever", "alone", "gone", "stay", "leave",
-            # Turkish personal
-            "ben", "sen", "biz", "neden", "nasıl", "iste", "dur", "ver", "al", "yalnız", "hep"
+            "bağır", "çığlık", "ateş", "yan", "öl", "kan", "vur", "kork", "delir", "nefret",
+            "savaş", "güm", "patla", "çıldır",
         ]
-        
+        weak_words = [
+            # Emotional climax vocabulary (needs to co-occur to matter)
+            "crushed", "smashed", "devastated", "collapse", "useless", "empty",
+            "pain", "tears", "broken", "hurt", "cry", "scars", "bleeding",
+            "alone", "gone", "forever", "nothing", "everything", "sorry", "drowned",
+            # Turkish emotional
+            "yık", "çök", "acı", "üzgün", "kayıp", "karanlık", "kırık", "yalnız",
+        ]
+
         # Count matching keywords (match whole words only to avoid false positives)
         text_lower = text.lower()
         text_words_set = set(re.findall(r'[a-zA-ZçğıöşüÇĞİÖŞÜ]+', text_lower))
-        matched_keywords = [w for w in intensity_words if w in text_words_set]
-        has_intensity_word = len(matched_keywords) > 0
-        
+        strong_matches = [w for w in strong_words if w in text_words_set]
+        weak_matches = [w for w in weak_words if w in text_words_set]
+        matched_keywords = strong_matches + weak_matches
+        # One aggressive word or an accumulation of emotional ones
+        has_intensity_word = len(strong_matches) >= 1 or len(weak_matches) >= 2
+
+        # Calm songs (low energy AND slow tempo) only reach Dramatic with explicit
+        # vocal-intensity markers baked into the lyric source (NOOOO / ALL CAPS)
+        is_calm_song = song_energy < 0.5 and song_bpm < 110
+
         # Determine intensity level (0-3)
         if not text.strip() or duration > 12.0:
             level = 0  # Calm/Silence
         else:
             level = 1  # Normal
-            
-            # Upgrade conditions
-            if cps > 5.5 or has_intensity_word or has_exclamation or is_repeated_chorus:
+
+            # Upgrade conditions (calm songs need noticeably denser lines to read as energetic)
+            cps_energetic_threshold = 9.0 if is_calm_song else 5.5
+            if cps > cps_energetic_threshold or has_intensity_word or has_exclamation or is_repeated_chorus:
                 level = 2  # Energetic
-            
+
             # Dynamic triggers for Dramatic/Glitch mode
             if (cps > 9.5) or \
-               (has_intensity_word and (cps > 7.0 or has_exclamation or len(matched_keywords) >= 2)) or \
+               (has_intensity_word and (cps > 7.0 or has_exclamation)) or \
                (is_uppercase) or \
                (has_elongation) or \
-               (is_repeated_chorus and (cps > 4.5 or has_intensity_word)) or \
-               (is_uppercase and has_intensity_word) or \
-               (has_exclamation and len(matched_keywords) >= 2) or \
-               (is_repeated_chorus and is_uppercase):
+               (is_repeated_chorus and cps > 4.5 and has_intensity_word) or \
+               (has_exclamation and len(strong_matches) >= 1):
                 level = 3  # Dramatic / Extreme
+
+            if level == 3 and is_calm_song and not (has_elongation or is_uppercase):
+                level = 2
                 
         # Speed modifier for typewriter/scrolling based on BPM
         speed_factor = 1.0 + (song_bpm - 120.0) / 120.0

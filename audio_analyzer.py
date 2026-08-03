@@ -41,6 +41,13 @@ class AudioAnalyzer:
         self._peak_bass = 0.001        # Adaptive normalization ceiling
         self._prev_energy = 0.0        # For onset detection
         self._last_kick_time = 0.0
+        self._cached_meter = None
+        self._last_session_check = 0
+        self._last_error_msg = None
+        self._envelope = 0.0           # Slow loudness envelope (~1.7s) for section detection
+        self._env_fast = 0.0           # Fast envelope (~0.3s) for surge/explosion detection
+        self._section_intensity = 0.0  # How loud the current SECTION is vs the song's loud parts (0-1)
+        self._surge = 0.0              # Fast/slow envelope ratio: >1 means loudness is exploding upward
 
     @property
     def available(self) -> bool:
@@ -79,11 +86,38 @@ class AudioAnalyzer:
             if self._target_app_keyword != keyword:
                 print(f"[AudioAnalyzer] Target isolated app updated to: {keyword}")
                 self._target_app_keyword = keyword
+                # Invalidate the cached meter so the new target is picked up immediately
+                self._cached_meter = None
+                self._last_session_check = 0
 
     def get_bass_energy(self) -> float:
         """Returns the current bass energy level (0.0 - 1.0)."""
         with self._lock:
             return self._bass_energy
+
+    def reset_adaptation(self):
+        """Resets the adaptive loudness ceiling. Call on track change so a quiet song
+        isn't measured against the previous loud song's ceiling."""
+        with self._lock:
+            self._peak_bass = 0.001
+            self._prev_energy = 0.0
+            self._envelope = 0.0
+            self._env_fast = 0.0
+            self._section_intensity = 0.0
+            self._surge = 0.0
+
+    def get_section_intensity(self) -> float:
+        """Returns how intense the current SECTION of the song is (0.0-1.0), based on a
+        slow loudness envelope relative to the track's loud parts. Quiet verses and
+        calm passages read low; choruses and drops read high."""
+        with self._lock:
+            return self._section_intensity
+
+    def get_surge(self) -> float:
+        """Returns the fast/slow envelope ratio (~0-2). Values noticeably above 1.0 mean
+        the loudness is exploding upward right now (a drop hitting, vocalist belting)."""
+        with self._lock:
+            return self._surge
 
     def get_kick_intensity(self) -> float:
         """Returns the current kick/onset transient intensity (0.0 - 1.0).
@@ -93,23 +127,36 @@ class AudioAnalyzer:
             self._kick_intensity = 0.0
             return val
 
+    def _log_error_once(self, msg: str):
+        """Prints an error only when it changes, to avoid flooding the console at 60 FPS."""
+        if msg != self._last_error_msg:
+            self._last_error_msg = msg
+            print(f"[AudioAnalyzer] {msg}")
+
     def _get_target_session_peak(self, pycaw_utilities, target_keyword):
         """Finds target audio session and queries its current peak volume level."""
         # Find and cache the meter if we don't have it, or check every 2 seconds
         now = time.time()
-        if not hasattr(self, '_cached_meter') or self._cached_meter is None or (now - getattr(self, '_last_session_check', 0)) > 2.0:
+        if self._cached_meter is None or (now - self._last_session_check) > 2.0:
             self._last_session_check = now
             self._cached_meter = None
             try:
                 sessions = pycaw_utilities.AudioUtilities.GetAllSessions()
                 for session in sessions:
                     if session.Process and target_keyword in session.Process.name().lower():
-                        if session.AudioMeterInformation:
-                            self._cached_meter = session.AudioMeterInformation
+                        # pycaw exposes no meter property on AudioSession; query the
+                        # IAudioMeterInformation COM interface from the session control
+                        try:
+                            meter = session._ctl.QueryInterface(pycaw_utilities.IAudioMeterInformation)
+                        except Exception as e:
+                            self._log_error_once(f"meter query failed for '{target_keyword}': {e}")
+                            meter = None
+                        if meter:
+                            self._cached_meter = meter
                             break
-            except Exception:
-                pass
-                
+            except Exception as e:
+                self._log_error_once(f"session enumeration failed: {e}")
+
         if self._cached_meter:
             try:
                 return self._cached_meter.GetPeakValue()
@@ -142,11 +189,13 @@ class AudioAnalyzer:
                 target_peak = self._get_target_session_peak(pcw, target_app)
 
                 if target_peak is not None:
-                    # Adaptive Peak normalizer for target_peak
+                    # Adaptive Peak normalizer for target_peak: the ceiling rises instantly
+                    # on loud peaks but decays slowly (~17s time constant), so quiet verses
+                    # read as genuinely low energy instead of re-normalizing back to 1.0
                     if target_peak > self._peak_bass:
                         self._peak_bass = target_peak
                     else:
-                        self._peak_bass = self._peak_bass * 0.985 + target_peak * 0.015
+                        self._peak_bass = self._peak_bass * 0.999 + target_peak * 0.001
                     self._peak_bass = max(self._peak_bass, 0.0005)
 
                     normalized = min(1.0, target_peak / self._peak_bass)
@@ -165,15 +214,30 @@ class AudioAnalyzer:
                         kick = min(1.0, onset * 6.0)
                         self._last_kick_time = now
 
+                    # Slow section envelope: EMA over ~1.7s of the raw peak, compared
+                    # against the adaptive ceiling — tells apart quiet verses from drops.
+                    # The fast envelope (~0.3s) versus the slow one detects sudden
+                    # loudness explosions (drops, belting vocals).
+                    self._envelope = self._envelope * 0.99 + target_peak * 0.01
+                    self._env_fast = self._env_fast * 0.95 + target_peak * 0.05
+                    section = min(1.0, self._envelope / max(self._peak_bass * 0.8, 0.0005))
+                    surge = min(2.0, self._env_fast / max(self._envelope, 0.0005))
+
                     with self._lock:
                         self._bass_energy = float(normalized)
+                        self._section_intensity = float(section)
+                        self._surge = float(surge)
                         if kick > self._kick_intensity:
                             self._kick_intensity = float(kick)
                 else:
                     # Target app silent or not found
+                    self._envelope *= 0.97
+                    self._env_fast *= 0.95
                     with self._lock:
                         self._bass_energy *= 0.8
                         self._kick_intensity *= 0.8
+                        self._section_intensity *= 0.95
+                        self._surge *= 0.95
 
                 time.sleep(0.016)  # ~60 FPS polling
 

@@ -2,11 +2,13 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 import time
 import traceback
 import websockets
+from websockets.exceptions import ConnectionClosed
 import webview
 import signal
 
@@ -46,6 +48,10 @@ last_position_payload = None
 force_sync_trigger = False
 current_track_offset = 0.0  # Real-time timing offset in seconds
 is_client_fullscreen = False
+current_cover_base64 = None  # Stores the current album cover as a base64 data URL for popup backgrounds
+current_accent_rgb = None    # Dominant cover color (r, g, b) sent by the frontend — popups use it as accent
+allowed_media_files = {}
+allowed_media_lock = threading.RLock()
 
 
 # Music sync globals for desktop window shake and pulse physics
@@ -54,6 +60,38 @@ current_song_energy = 0.5
 current_playback_position = 0.0
 last_position_update_time = time.time()
 is_playback_paused = True
+
+MEDIA_EXTENSIONS = {'.mp4', '.webm', '.mov', '.mkv', '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
+
+def register_media_file(media_path: str):
+    """Registers a user-selected media file and returns a localhost URL for this app session."""
+    if not media_path:
+        return None
+
+    normalized_path = os.path.abspath(os.path.normpath(media_path))
+    ext = os.path.splitext(normalized_path)[1].lower()
+    if ext not in MEDIA_EXTENSIONS or not os.path.isfile(normalized_path):
+        return None
+
+    with allowed_media_lock:
+        for token, existing_path in allowed_media_files.items():
+            if os.path.normcase(existing_path) == os.path.normcase(normalized_path):
+                return f"http://127.0.0.1:8766/media/{token}"
+
+        token = secrets.token_urlsafe(24)
+        allowed_media_files[token] = normalized_path
+        return f"http://127.0.0.1:8766/media/{token}"
+
+def is_registered_media_file(media_path: str) -> bool:
+    """Checks whether a path was selected through this app during the current session."""
+    if not media_path:
+        return False
+    normalized_path = os.path.abspath(os.path.normpath(media_path))
+    with allowed_media_lock:
+        return any(
+            os.path.normcase(path) == os.path.normcase(normalized_path)
+            for path in allowed_media_files.values()
+        )
 
 def save_offset_to_cache(artist: str, title: str, offset: float, duration: float = 0.0):
     """Saves the user adjusted lyric sync offset back to the song's JSON cache."""
@@ -75,20 +113,10 @@ def save_offset_to_cache(artist: str, title: str, offset: float, duration: float
 def save_line_media_to_cache(artist: str, title: str, duration: float, line_index: int, media_path: str):
     """Updates the 'media' property of a specific lyric line in the cache."""
     try:
-        from lyrics_provider import get_cache_path
-        query = f"{artist} {title}"
-        cache_key = query
-        if duration > 0.0:
-            cache_key = f"{query}_{int(duration)}"
-            
-        cache_path = get_cache_path("lyrics", cache_key)
+        cache_path = resolve_lyrics_cache_path(artist, title, duration)
         if not os.path.exists(cache_path):
-            cache_path_fallback = get_cache_path("lyrics", query)
-            if os.path.exists(cache_path_fallback):
-                cache_path = cache_path_fallback
-            else:
-                return False
-                
+            return False
+
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             
@@ -111,26 +139,14 @@ def save_edited_lyrics(artist: str, title: str, duration: float, edited_text: st
     """Aligns edited text lines with cached lyric structures to preserve times, and saves to cache."""
     try:
         import difflib
-        from lyrics_provider import get_cache_path
-        
-        # Incorporate duration into cache key matching fetch_synced_lyrics behavior
-        query = f"{artist} {title}"
-        cache_key = query
-        if duration > 0.0:
-            cache_key = f"{query}_{int(duration)}"
-            
-        cache_path = get_cache_path("lyrics", cache_key)
+
+        cache_path = resolve_lyrics_cache_path(artist, title, duration)
         print(f"[CACHE] Target cache path for saving edited lyrics: {cache_path}")
-        
+
         if not os.path.exists(cache_path):
-            # If duration-based file doesn't exist, fallback to general key
-            cache_path_fallback = get_cache_path("lyrics", query)
-            if os.path.exists(cache_path_fallback):
-                cache_path = cache_path_fallback
-            else:
-                print(f"[CACHE] No cached lyrics file found to edit for '{title}' by '{artist}'")
-                return False
-                
+            print(f"[CACHE] No cached lyrics file found to edit for '{title}' by '{artist}'")
+            return False
+
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             
@@ -238,9 +254,38 @@ tracker = None
 bpm_provider = None
 audio_analyzer = None
 
+def get_ws_origin(websocket):
+    """Extracts the Origin header, compatible with both new and legacy websockets APIs."""
+    try:
+        request = getattr(websocket, "request", None)
+        if request is not None and hasattr(request, "headers"):
+            return request.headers.get("Origin")
+        return websocket.request_headers.get("Origin")
+    except Exception:
+        return None
+
+def is_forbidden_ws_origin(origin) -> bool:
+    """Browser tabs always send an http(s) Origin; the local pywebview client sends
+    no Origin, 'null', or a file:// origin. Reject non-local http(s) origins so
+    arbitrary web pages cannot drive the app."""
+    if not origin:
+        return False
+    origin = origin.lower()
+    if not origin.startswith(("http://", "https://")):
+        return False
+    return not origin.startswith((
+        "http://127.0.0.1", "https://127.0.0.1",
+        "http://localhost", "https://localhost",
+    ))
+
 async def register(websocket):
     """Registers a new WebSocket client and syncs the current state immediately."""
-    global force_sync_trigger, current_track_offset, last_track_payload, is_client_fullscreen
+    global force_sync_trigger, current_track_offset, last_track_payload, is_client_fullscreen, enable_popups, enable_shake, shake_intensity_scale, current_accent_rgb
+    origin = get_ws_origin(websocket)
+    if is_forbidden_ws_origin(origin):
+        print(f"Rejected WebSocket connection from browser origin: {origin}")
+        await websocket.close(code=4403, reason="Forbidden origin")
+        return
     connected_clients.add(websocket)
     print(f"Client connected. Total clients: {len(connected_clients)}")
     
@@ -250,7 +295,11 @@ async def register(websocket):
             await websocket.send(json.dumps(last_track_payload))
         if last_position_payload:
             await websocket.send(json.dumps(last_position_payload))
-            
+        # Re-send the cover: cover_ready is otherwise a one-shot broadcast, and a client
+        # that reconnects (e.g. after a fullscreen toggle) would be left with a black background
+        if current_cover_base64:
+            await websocket.send(json.dumps({"type": "cover_ready", "base64": current_cover_base64}))
+
         async for message in websocket:
             try:
                 data = json.loads(message)
@@ -274,6 +323,9 @@ async def register(websocket):
                     media_path = data.get("media_path")
                     print(f"WS set_line_media action received for index {line_index}")
                     if last_track_payload and line_index is not None:
+                        if not is_registered_media_file(media_path):
+                            print(f"Rejected unregistered media path for line {line_index}")
+                            continue
                         success = save_line_media_to_cache(
                             last_track_payload["artist"],
                             last_track_payload["title"],
@@ -312,23 +364,51 @@ async def register(websocket):
                     # Broadcast the offset update to all clients
                     await broadcast({"type": "offset", "offset": new_offset})
                 elif data.get("action") == "settings":
-                    global enable_popups, enable_shake
                     settings = data.get("settings", {})
                     enable_popups = settings.get("popups", True)
                     enable_shake = settings.get("shake", True)
-                    print(f"WS Settings updated: Popups={enable_popups}, Shake={enable_shake}")
+                    try:
+                        shake_intensity_scale = max(0.1, min(1.5, float(settings.get("shake_intensity", 1.0))))
+                    except (TypeError, ValueError):
+                        shake_intensity_scale = 1.0
+                    print(f"WS Settings updated: Popups={enable_popups}, Shake={enable_shake}, Intensity={shake_intensity_scale:.1f}x")
                 elif data.get("action") == "set_fullscreen":
-                    global is_client_fullscreen
                     is_client_fullscreen = data.get("state", False)
                     print(f"WS Fullscreen state updated: {is_client_fullscreen}")
                     if is_client_fullscreen:
                         close_all_popups("fullscreen_entered")
+                elif data.get("action") == "media_control":
+                    cmd = data.get("command")
+                    if cmd in ("playpause", "next", "previous") and tracker:
+                        ok = await tracker.send_control(cmd)
+                        print(f"[CONTROL] {cmd} -> {'ok' if ok else 'rejected'}")
+                        if cmd in ("next", "previous"):
+                            force_sync_trigger = True
+                elif data.get("action") == "seek":
+                    try:
+                        seek_pos = float(data.get("position", -1.0))
+                    except (TypeError, ValueError):
+                        seek_pos = -1.0
+                    seek_dur = last_track_payload.get("duration", 0.0) if last_track_payload else 0.0
+                    if tracker and seek_pos >= 0 and (seek_dur <= 0 or seek_pos <= seek_dur):
+                        ok = await tracker.seek_to(seek_pos)
+                        print(f"[CONTROL] seek {seek_pos:.1f}s -> {'ok' if ok else 'rejected'}")
+                        force_sync_trigger = True
+                elif data.get("action") == "set_accent":
+                    rgb = data.get("rgb")
+                    if isinstance(rgb, list) and len(rgb) == 3:
+                        try:
+                            current_accent_rgb = tuple(max(0, min(255, int(v))) for v in rgb)
+                        except (TypeError, ValueError):
+                            pass
                 elif data.get("action") == "log":
                     print(f"[FRONTEND LOG] {data.get('message')}")
             except Exception as e:
-                pass
-    except Exception as e:
+                print(f"Error handling WS message: {e}")
+    except ConnectionClosed:
         pass
+    except Exception as e:
+        print(f"WebSocket client error: {e}")
     finally:
         connected_clients.remove(websocket)
         print(f"Client disconnected. Total clients: {len(connected_clients)}")
@@ -339,7 +419,7 @@ async def broadcast(message_dict):
         return
     message_str = json.dumps(message_dict)
     await asyncio.gather(
-        *[client.send(message_str) for client in connected_clients],
+        *[client.send(message_str) for client in list(connected_clients)],
         return_exceptions=True
     )
 
@@ -347,13 +427,15 @@ async def broadcast(message_dict):
 popup_windows = []
 popup_close_task = None
 should_shake_windows = False
+should_shake_main = False  # Main notepad window shake during ultimate climax moments
 enable_popups = True
 enable_shake = True
+shake_intensity_scale = 1.0  # User-adjustable multiplier from the settings slider (0.1-1.5)
 last_popup_spawn_time = 0.0
 
 async def shake_windows_loop():
-    """Shakes popup windows in sync with real-time bass/kick energy from system audio.
-    Falls back to BPM-based simulation if audio capture is unavailable."""
+    """Shakes popup windows (and the main notepad window during ultimate climax moments)
+    in sync with real-time bass energy from the target app's audio."""
     global should_shake_windows, audio_analyzer
     import random
 
@@ -364,48 +446,144 @@ async def shake_windows_loop():
             except Exception:
                 pass
 
+    was_shaking = False
+    main_anchor = None   # Main window's resting position, captured for the duration of a climax
+    last_main_cmd = None          # Last position WE commanded — used to detect user drags
+    main_drag_pause_until = 0.0   # While set in the future, leave the main window alone
+    shake_gain = 0.0     # Smoothed 0-1 gain: ramps up in loud sections, down to zero in calm ones
+    smooth_bass = 0.0    # Smoothed bass so single non-bass transients (vocals/fx) don't jolt windows
+    audio_hot_active = False  # Latched audio-drop state (with hysteresis, so it doesn't flap)
+    audio_hot_streak = 0      # Consecutive ticks the drop condition has held (sustain requirement)
     while True:
         try:
             moves = []
-            if should_shake_windows and enable_shake and popup_windows:
-                # Read real bass energy from the audio analyzer
-                bass = 0.0
-                if audio_analyzer and audio_analyzer.available:
-                    bass = audio_analyzer.get_bass_energy()
-                
-                # Only shake if bass energy is significant (threshold filters silence/calm)
-                if bass > 0.12:
-                    wins = list(popup_windows)
-                    for win in wins:
+            main_win = webview.windows[0] if webview.windows else None
+            shake_popups_now = should_shake_windows and enable_shake and bool(popup_windows)
+            shake_main_now = should_shake_main and enable_shake and main_win is not None
+
+            # Target gain is driven by the ACTUAL audio: the slow section envelope tells
+            # apart quiet/calm passages (gain 0 → no shake at all) from loud choruses/drops
+            raw_gain = 0.0
+            bass = 0.0
+            audio_hot = False
+            if enable_shake and not is_playback_paused and audio_analyzer and audio_analyzer.available:
+                bass = audio_analyzer.get_bass_energy()
+                section = audio_analyzer.get_section_intensity()
+                surge = audio_analyzer.get_surge()
+                if bass > 0.05:
+                    # 1) Lyric-driven: the song's favorite parts (chorus / ultimate climax),
+                    #    still requiring the section to actually be loud
+                    if shake_popups_now or shake_main_now:
+                        raw_gain = max(0.0, min(1.0, (section - 0.55) / 0.35))
+
+                    # 2) Audio-driven, independent of lyrics: a REAL drop or belting vocals.
+                    #    Modern tracks are heavily compressed, so momentary transients cross
+                    #    naive thresholds constantly — require the explosion to be SUSTAINED
+                    #    (~0.5s continuously) before latching, then hold with hysteresis
+                    #    so it doesn't flap on/off every phrase.
+                    if audio_hot_active:
+                        if section < 0.75:
+                            audio_hot_active = False
+                    else:
+                        if section > 0.85 and surge > 1.25:
+                            audio_hot_streak += 1
+                        else:
+                            audio_hot_streak = 0
+                        if audio_hot_streak >= 20:  # ~0.5s at 40 FPS
+                            audio_hot_active = True
+
+                    if audio_hot_active:
+                        audio_hot = True
+                        raw_gain = max(raw_gain, min(1.0, (section - 0.75) / 0.25))
+                else:
+                    audio_hot_active = False
+                    audio_hot_streak = 0
+            else:
+                audio_hot_active = False
+                audio_hot_streak = 0
+
+            # Smooth both the gain (~0.5s ramp) and the bass (~0.15s) so shaking
+            # fades in/out gently instead of snapping on isolated loud sounds
+            shake_gain += (raw_gain - shake_gain) * 0.08
+            smooth_bass += (bass - smooth_bass) * 0.2
+
+            if shake_gain > 0.03:
+                # Scale shake strength by the song's overall energy so calm songs tremble
+                # subtly while energetic ones rattle hard, then apply the user's slider
+                energy_scale = (max(0.15, min(1.0, current_song_energy)) ** 1.3) * shake_intensity_scale
+                if not was_shaking:
+                    was_shaking = True
+                    mode = "audio-drop" if audio_hot and not (shake_popups_now or shake_main_now) else "climax"
+                    print(f"[SHAKE] Shaking popups={len(popup_windows)} main={shake_main_now or audio_hot} mode={mode} (bass={bass:.2f}, gain={raw_gain:.2f}, energy={current_song_energy:.2f})")
+                if popup_windows and (shake_popups_now or audio_hot):
+                    for win in list(popup_windows):
                         if hasattr(win, "orig_x") and hasattr(win, "orig_y"):
-                            base_amt = 10.0 if getattr(win, "is_ultimate_climax", False) else 5.0
-                            amt = base_amt * bass
+                            base_amt = 20.0 if getattr(win, "is_ultimate_climax", False) else 10.0
+                            amt = base_amt * smooth_bass * energy_scale * shake_gain
                             dx = (random.random() * 2 - 1) * amt
                             dy = (random.random() * 2 - 1) * amt
                             moves.append((win, int(win.orig_x + dx), int(win.orig_y + dy)))
-                else:
-                    # Bass too low — restore original positions smoothly
-                    wins = list(popup_windows)
-                    for win in wins:
-                        if hasattr(win, "orig_x") and hasattr(win, "orig_y"):
-                            moves.append((win, win.orig_x, win.orig_y))
+                if main_win is not None and (shake_main_now or audio_hot) and time.time() >= main_drag_pause_until:
+                    try:
+                        cur_pos = (main_win.x, main_win.y)
+                    except Exception:
+                        cur_pos = None
+                    if main_anchor is not None and cur_pos is not None and last_main_cmd is not None and \
+                            (abs(cur_pos[0] - last_main_cmd[0]) > 45 or abs(cur_pos[1] - last_main_cmd[1]) > 45):
+                        # The window is not where we last put it — the user is dragging it.
+                        # Back off entirely and re-anchor at the new spot after a pause.
+                        main_anchor = None
+                        last_main_cmd = None
+                        main_drag_pause_until = time.time() + 2.5
+                    else:
+                        if main_anchor is None:
+                            main_anchor = cur_pos
+                            last_main_cmd = cur_pos
+                        if main_anchor is not None:
+                            amt = 8.0 * smooth_bass * energy_scale * shake_gain
+                            dx = (random.random() * 2 - 1) * amt
+                            dy = (random.random() * 2 - 1) * amt
+                            nx, ny = int(main_anchor[0] + dx), int(main_anchor[1] + dy)
+                            last_main_cmd = (nx, ny)
+                            moves.append((main_win, nx, ny))
             else:
-                # Not shaking — restore original positions
-                wins = list(popup_windows)
-                for win in wins:
+                # Gain faded out — rest everything at original positions
+                if was_shaking:
+                    was_shaking = False
+                    print("[SHAKE] Faded out (calm section or climax ended)")
+                for win in list(popup_windows):
                     if hasattr(win, "orig_x") and hasattr(win, "orig_y"):
                         moves.append((win, win.orig_x, win.orig_y))
-                        
+                if main_anchor is not None:
+                    if main_win is not None:
+                        try:
+                            cur_pos = (main_win.x, main_win.y)
+                        except Exception:
+                            cur_pos = None
+                        if cur_pos is not None and last_main_cmd is not None and \
+                                (abs(cur_pos[0] - last_main_cmd[0]) > 45 or abs(cur_pos[1] - last_main_cmd[1]) > 45):
+                            # User dragged the window mid-restore — leave it where they put it
+                            main_anchor = None
+                            last_main_cmd = None
+                            main_drag_pause_until = time.time() + 2.5
+                        else:
+                            last_main_cmd = main_anchor
+                            moves.append((main_win, main_anchor[0], main_anchor[1]))
+                    # Release the anchor once neither trigger is eligible anymore
+                    if main_anchor is not None and not shake_main_now and not audio_hot:
+                        main_anchor = None
+                        last_main_cmd = None
+
             if moves:
                 await asyncio.to_thread(do_moves, moves)
-                
+
         except Exception:
             pass
         await asyncio.sleep(0.025)  # ~40 FPS
 
 
 async def audio_broadcast_loop():
-    """Broadcasts real-time bass and kick energy data to all connected WebSocket clients at ~25 FPS."""
+    """Broadcasts real-time bass and kick energy data to all connected WebSocket clients at ~12 FPS."""
     global audio_analyzer
     while True:
         try:
@@ -421,6 +599,13 @@ async def audio_broadcast_loop():
             pass
         await asyncio.sleep(0.08)  # ~12 FPS broadcast rate (frontend smooths values)
 
+VOWEL_GROUP_RE = re.compile(r'[aeıioöuüAEIİOÖUÜ]+')
+
+def estimate_word_weight(word: str) -> float:
+    """Rough singing-time weight for a word: syllable count (vowel groups) tracks how
+    long a word is actually sung far better than raw character length."""
+    return max(1.0, float(len(VOWEL_GROUP_RE.findall(word))))
+
 def stretch_word_text(word_text: str, duration: float) -> str:
     """Stretches vowels in a word if it is sung for a long time (low characters per second),
     and appends '...' dots for long pauses."""
@@ -430,7 +615,7 @@ def stretch_word_text(word_text: str, duration: float) -> str:
         
     # Separate prefix, core word, and suffix (punctuation)
     # e.g., "away?!" -> prefix="", core="away", suffix="?!"
-    match = re.match(r'^([^a-zA-Z]*)(.*?)([^a-zA-Z]*)$', stripped)
+    match = re.match(r'^([^a-zA-ZçğıöşüÇĞİÖŞÜ]*)(.*?)([^a-zA-ZçğıöşüÇĞİÖŞÜ]*)$', stripped)
     if not match:
         return word_text
         
@@ -447,8 +632,8 @@ def stretch_word_text(word_text: str, duration: float) -> str:
         extra_count = int(duration * 5.0) - char_count
         extra_count = min(8, max(1, extra_count))  # Cap extra characters between 1 and 8
         
-        # Find the last vowel
-        vowels = "aeiouAEIOU"
+        # Find the last vowel (including Turkish vowels)
+        vowels = "aeıioöuüAEIİOÖUÜ"
         vowel_indices = [i for i, c in enumerate(core) if c in vowels]
         
         if vowel_indices:
@@ -476,229 +661,127 @@ def stretch_word_text(word_text: str, duration: float) -> str:
     return prefix + stretched_core + suffix + dots + trailing_spaces
 
 def get_popup_html(words: list, title_text: str, target_unix_time: float, is_climax: bool = False) -> str:
-    """Generates a dynamic HTML string for the lightweight Notepad pop-up window."""
-    title_upper = title_text.strip().upper()
+    """Generates a dynamic HTML string for the lightweight pop-up window with glassmorphism and cover background."""
     words_json = json.dumps(words)
     target_unix_time_ms = int(target_unix_time * 1000)
     
+    # Accent follows the album cover's dominant color when known, so popups
+    # visually belong to the song; falls back to the original violet/pink
     if is_climax:
-        # Ultimate Climax — dramatic dark with magenta/violet neon glow
-        return f"""
+        if current_accent_rgb:
+            r, g, b = current_accent_rgb
+            # Brightened toward white for the ultimate climax glow
+            accent_color = f"{min(255, int(r * 0.65 + 90))}, {min(255, int(g * 0.65 + 90))}, {min(255, int(b * 0.65 + 90))}"
+        else:
+            accent_color = "236, 72, 153"  # Pinkish glow fallback
+        font_size = "48px"
+        bg_alpha = "0.75"
+    else:
+        if current_accent_rgb:
+            accent_color = f"{current_accent_rgb[0]}, {current_accent_rgb[1]}, {current_accent_rgb[2]}"
+        else:
+            accent_color = "139, 92, 246"  # Violet fallback
+        font_size = "32px"
+        bg_alpha = "0.65"
+    
+    # Use the global base64 cover data directly - no HTTP request needed
+    cover_url = current_cover_base64 if current_cover_base64 else ''
+
+    return f"""
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="UTF-8">
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@800&display=swap');
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
-            background: #030108;
+            background: transparent;
             overflow: hidden;
-            display: flex;
-            flex-direction: column;
-            height: 100vh;
-            width: 100vw;
-        }}
-        .popup-window {{
-            width: 100vw;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-            background: radial-gradient(ellipse at center, #0a0515 0%, #030108 70%);
-            border: 2px solid #8b5cf6;
-            box-shadow: 
-                0 0 30px rgba(139, 92, 246, 0.3),
-                0 0 60px rgba(236, 72, 153, 0.1),
-                inset 0 0 40px rgba(139, 92, 246, 0.05);
-            animation: glow-pulse 0.8s infinite ease-in-out;
-        }}
-        .title-strip {{
-            height: 28px;
-            background: linear-gradient(90deg, rgba(139, 92, 246, 0.15) 0%, rgba(236, 72, 153, 0.1) 100%);
-            border-bottom: 1px solid rgba(139, 92, 246, 0.3);
-            display: flex;
-            align-items: center;
-            padding: 0 12px;
-        }}
-        .title-label {{
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 10px;
-            font-weight: 700;
-            color: rgba(236, 72, 153, 0.8);
-            letter-spacing: 0.15em;
-            text-transform: uppercase;
-        }}
-        .content-area {{
-            flex-grow: 1;
             display: flex;
             justify-content: center;
             align-items: center;
-            padding: 20px;
+            height: 100vh;
+            width: 100vw;
+            padding: 0;
+        }}
+        .glass-card {{
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            position: relative;
+            border-radius: 22px;
+            box-shadow: inset 0 0 40px rgba({accent_color}, 0.15);
+            overflow: hidden;
+            animation: popIn 0.3s cubic-bezier(0.2, 0.9, 0.3, 1.15);
+        }}
+        @keyframes popIn {{
+            from {{ opacity: 0; transform: scale(0.9); }}
+            to   {{ opacity: 1; transform: scale(1); }}
+        }}
+        .background-layer {{
+            position: absolute;
+            top: -10%; left: -10%; width: 120%; height: 120%;
+            background-image: url('{cover_url}');
+            background-size: cover;
+            background-position: center;
+            filter: blur(20px) brightness(0.6);
+            z-index: 0;
+        }}
+        .overlay-layer {{
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(15, 15, 18, {bg_alpha});
+            z-index: 1;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 22px;
         }}
         .lyric-text {{
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 32px;
-            font-weight: 700;
+            position: relative;
+            z-index: 2;
+            font-family: 'Inter', sans-serif;
+            font-size: {font_size};
+            font-weight: 800;
             color: #ffffff;
             text-align: center;
             white-space: pre-wrap;
-            line-height: 1.4;
-            text-shadow: 
-                0 0 15px rgba(139, 92, 246, 0.7),
-                0 0 40px rgba(236, 72, 153, 0.3);
+            word-wrap: break-word;
+            width: 100%;
+            line-height: 1.3;
+            letter-spacing: -0.5px;
+            text-shadow: 0 0 20px rgba({accent_color}, 1.0), 0 0 40px rgba({accent_color}, 0.6), 0 0 10px rgba(0,0,0,1.0);
             text-transform: uppercase;
-            letter-spacing: 0.05em;
+            padding: 20px;
         }}
         .cursor-glow {{
-            color: #ec4899;
-            font-weight: 700;
-            animation: blink-fast 0.3s step-end infinite;
-            text-shadow: 0 0 12px rgba(236, 72, 153, 0.8);
+            display: inline-block;
+            width: 4px;
+            height: calc({font_size} * 0.9);
+            background: rgb({accent_color});
+            margin-left: 4px;
+            vertical-align: middle;
+            animation: blink-fast 0.8s step-end infinite;
+            border-radius: 2px;
+            box-shadow: 0 0 10px rgba({accent_color}, 0.8);
         }}
         @keyframes blink-fast {{
             50% {{ opacity: 0; }}
         }}
-        @keyframes glow-pulse {{
-            0%, 100% {{ 
-                box-shadow: 0 0 25px rgba(139, 92, 246, 0.25), 0 0 50px rgba(236, 72, 153, 0.08), inset 0 0 40px rgba(139, 92, 246, 0.03);
-                border-color: #8b5cf6;
-            }}
-            50% {{ 
-                box-shadow: 0 0 45px rgba(139, 92, 246, 0.4), 0 0 80px rgba(236, 72, 153, 0.15), inset 0 0 60px rgba(139, 92, 246, 0.06);
-                border-color: #ec4899;
-            }}
-        }}
         </style>
     </head>
     <body>
-        <div class="popup-window">
-            <div class="title-strip">
-                <span class="title-label">🔥 {title_upper}.txt — climax</span>
-            </div>
-            <div class="content-area">
-                <div class="lyric-text"><span id="lyric-content"></span><span class="cursor-glow">│</span></div>
-            </div>
+        <div class="glass-card">
+            <div class="background-layer"></div>
+            <div class="overlay-layer"></div>
+            <div class="lyric-text"><span id="lyric-content"></span><span class="cursor-glow"></span></div>
         </div>
         <script>
             const words = {words_json};
             const targetTimeMs = {target_unix_time_ms};
             const contentSpan = document.getElementById('lyric-content');
             
-            // Adjust start time if the window loaded late to ensure we always show the typing animation from the beginning
-            let startTime = targetTimeMs;
-            const now = Date.now();
-            if (now > targetTimeMs) {{
-                startTime = now;
-            }}
-            
-            function updateWords() {{
-                const elapsed = (Date.now() - startTime) / 1000.0;
-                let text = "";
-                for (let i = 0; i < words.length; i++) {{
-                    if (elapsed < words[i].time) break;
-                    let nextTime = (i + 1 < words.length) ? words[i + 1].time : (words.length > 1 ? words[i].time + Math.min(2.0, ((words[i].time - words[0].time) / (words.length - 1)) * 1.5) : words[i].time + 1.0);
-                    let wordDuration = Math.max(0.05, nextTime - words[i].time);
-                    let wordText = words[i].text.toUpperCase();
-                    let typingDuration = wordDuration;
-                    let wordElapsed = elapsed - words[i].time;
-                    let fraction = Math.min(1.0, wordElapsed / typingDuration);
-                    text += wordText.slice(0, Math.ceil(wordText.length * fraction));
-                }}
-                contentSpan.innerText = text.replace(/^\\s+/, "");
-                requestAnimationFrame(updateWords);
-            }}
-            requestAnimationFrame(updateWords);
-        </script>
-    </body>
-    </html>
-    """
-    else:
-        # Normal popup — sleek dark glassmorphic with violet accent
-        return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600&display=swap');
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            background: #0f1117;
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-            height: 100vh;
-            width: 100vw;
-        }}
-        .popup-window {{
-            width: 100vw;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-            background: linear-gradient(145deg, #0f1117 0%, #161822 100%);
-            border: 1px solid rgba(139, 92, 246, 0.2);
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-        }}
-        .title-strip {{
-            height: 26px;
-            background: rgba(139, 92, 246, 0.06);
-            border-bottom: 1px solid rgba(139, 92, 246, 0.1);
-            display: flex;
-            align-items: center;
-            padding: 0 10px;
-        }}
-        .title-label {{
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 9px;
-            font-weight: 600;
-            color: rgba(139, 92, 246, 0.6);
-            letter-spacing: 0.12em;
-            text-transform: uppercase;
-        }}
-        .content-area {{
-            flex-grow: 1;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 12px;
-        }}
-        .lyric-text {{
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 16px;
-            font-weight: 600;
-            color: #e2e8f0;
-            text-align: center;
-            white-space: pre-wrap;
-            line-height: 1.5;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            text-shadow: 0 0 8px rgba(139, 92, 246, 0.2);
-        }}
-        .cursor-dim {{
-            color: rgba(139, 92, 246, 0.6);
-            font-weight: 600;
-            animation: blink 0.8s step-end infinite;
-        }}
-        @keyframes blink {{
-            50% {{ opacity: 0; }}
-        }}
-        </style>
-    </head>
-    <body>
-        <div class="popup-window">
-            <div class="title-strip">
-                <span class="title-label">♫ {title_upper}.txt</span>
-            </div>
-            <div class="content-area">
-                <div class="lyric-text"><span id="lyric-content"></span><span class="cursor-dim">│</span></div>
-            </div>
-        </div>
-        <script>
-            const words = {words_json};
-            const targetTimeMs = {target_unix_time_ms};
-            const contentSpan = document.getElementById('lyric-content');
-            
-            // Adjust start time if the window loaded late to ensure we always show the typing animation from the beginning
             let startTime = targetTimeMs;
             const now = Date.now();
             if (now > targetTimeMs) {{
@@ -734,14 +817,22 @@ def get_popup_html(words: list, title_text: str, target_unix_time: float, is_cli
 popup_zone_index = 0
 active_ultimate_climax_win = None  # Only one ultimate climax window at a time
 
+def get_main_window_rect(screen_w: int, screen_h: int):
+    """Returns the main window's actual (x, y, w, h), falling back to a centered 850x600."""
+    try:
+        win = webview.windows[0]
+        x, y, w, h = win.x, win.y, win.width, win.height
+        if w and h:
+            return x, y, w, h
+    except Exception:
+        pass
+    return (screen_w - 850) // 2, (screen_h - 600) // 2, 850, 600
+
 def get_popup_zones(screen_w: int, screen_h: int, popup_w: int, popup_h: int):
     """Returns a list of (x, y) positions for popup zones positioned closely
-    around the centered main window (850x600)."""
-    main_w = 850
-    main_h = 600
-    main_x = (screen_w - main_w) // 2
-    main_y = (screen_h - main_h) // 2
-    
+    around the main window's current position."""
+    main_x, main_y, main_w, main_h = get_main_window_rect(screen_w, screen_h)
+
     gap = 20
     
     zones = [
@@ -865,8 +956,8 @@ def spawn_popup_window(line: dict, artist: str, title: str, target_unix_time: fl
     screen_h = screens[0].height if screens else 1080
     
     if is_climax:
-        width = 650
-        height = 320
+        width = 900
+        height = 350
         
         # Get currently active ultimate climax windows
         active_ultimates = [w for w in popup_windows if getattr(w, "is_ultimate_climax", False)]
@@ -892,8 +983,8 @@ def spawn_popup_window(line: dict, artist: str, title: str, target_unix_time: fl
         else:
             x, y = slot2
     else:
-        width = 300
-        height = 180
+        width = 450
+        height = 200
         
         # Keep at most 4 regular popups open
         MAX_POPUPS = 4
@@ -995,18 +1086,41 @@ def spawn_popup_window(line: dict, artist: str, title: str, target_unix_time: fl
             pass
             
         def do_create_window():
+            # on_top is required: LyricPad runs in the background, and Windows prevents
+            # background processes from bringing new windows to the foreground — without
+            # topmost, popups silently open BEHIND whatever app the user is using.
             return webview.create_window(
-                title=f"🔥 {win_title}.txt" if is_climax else f"📄 {win_title}.txt",
+                title=f"🔥 {win_title}" if is_climax else f"📄 {win_title}",
                 html=html_content,
                 width=width,
                 height=height,
                 x=x,
                 y=y,
                 resizable=True,
-                text_select=True
+                text_select=False,
+                frameless=True,
+                transparent=True,
+                on_top=True,
+                background_color='#0f1117'
             )
             
         win = do_create_window()
+
+        def _darken_window_backcolor():
+            # pywebview leaves the WinForms BackColor at its light-gray default for
+            # transparent windows; it peeks through the rounded card corners as white
+            # blobs. Paint the form near-black so the corners blend into the card.
+            try:
+                from System.Drawing import Color
+                win.native.BackColor = Color.FromArgb(15, 17, 23)
+            except Exception:
+                pass
+
+        try:
+            win.events.shown += _darken_window_backcolor
+        except Exception:
+            pass
+
         win.orig_x = x
         win.orig_y = y
         win.is_ultimate_climax = is_climax
@@ -1019,22 +1133,30 @@ def spawn_popup_window(line: dict, artist: str, title: str, target_unix_time: fl
         print(f"Failed to spawn popup window: {e}")
 
 def safe_destroy_window(win):
-    """Safely destroys a pywebview window using standard destroy."""
+    """Fades the NATIVE window out, then destroys it. Fading in the page instead would
+    expose the form's solid background as a dark slab until the destroy happens."""
     if win not in webview.windows:
         return
     def do_destroy():
         try:
+            form = getattr(win, 'native', None)
+            if form is not None:
+                for step in range(8):
+                    form.Opacity = 1.0 - (step + 1) / 8.0
+                    time.sleep(0.035)
+        except Exception:
+            pass
+        try:
             win.destroy()
         except Exception:
             pass
-    # We can just call it directly as destroy() handles threading gracefully in pywebview
-    # but to be safe we can use a thread
     threading.Thread(target=do_destroy, daemon=True).start()
 
 def close_all_popups(reason="unknown"):
     """Destroys all open popup windows immediately."""
-    global popup_windows, should_shake_windows, popup_zone_index, active_ultimate_climax_win
+    global popup_windows, should_shake_windows, should_shake_main, popup_zone_index, active_ultimate_climax_win
     should_shake_windows = False
+    should_shake_main = False
     popup_zone_index = 0
     active_ultimate_climax_win = None
     if not popup_windows:
@@ -1048,6 +1170,7 @@ async def monitor_media():
     """Background task to poll media player status and broadcast updates."""
     global last_track_payload, last_position_payload, popup_windows, popup_close_task, current_track_offset, last_popup_spawn_time
     global current_song_bpm, current_song_energy, current_playback_position, last_position_update_time, is_playback_paused
+    global current_cover_base64, current_accent_rgb, should_shake_windows, should_shake_main, force_sync_trigger
     
     print("Starting media monitor loop...")
     last_title = None
@@ -1072,22 +1195,54 @@ async def monitor_media():
     lyrics_load_task = None
     consecutive_none_reads = 0
     last_full_fetch_time = 0.0
+    cover_request_id = 0
 
-    async def fetch_and_process_track_details(target_title, target_artist, target_source, target_duration):
+    async def fetch_and_process_track_details(target_title, target_artist, target_source, target_duration, target_album, target_cover_request_id):
         nonlocal lyrics_data, song_bpm, song_energy, song_valence
         global last_track_payload, last_position_payload, current_track_offset, current_song_bpm, current_song_energy
-        
+
         async def download_and_notify_cover():
-            success = await cover_manager.download_cover(target_artist, target_title)
+            global current_cover_base64
+            # 1. Prefer the exact artwork the player itself exposes via the media session.
+            #    Short delays let the player publish the new track's thumbnail (avoids stale art).
+            success = False
+            try:
+                await asyncio.sleep(1.0)
+                thumb = await tracker.get_thumbnail_bytes(expected_title=target_title)
+                if thumb is None:
+                    await asyncio.sleep(1.5)
+                    thumb = await tracker.get_thumbnail_bytes(expected_title=target_title)
+                if thumb:
+                    success = await asyncio.to_thread(cover_manager.save_cover_bytes, thumb)
+                    if success:
+                        print(f"Using media session thumbnail as cover for '{target_title}' ({len(thumb)} bytes)")
+            except Exception as e:
+                print(f"Media session thumbnail unavailable: {e}")
+
+            # 2. Fallback: album-aware iTunes search
+            if not success:
+                success = await cover_manager.download_cover(target_artist, target_title, target_album)
+
             if success:
                 import base64
                 try:
+                    if target_cover_request_id != cover_request_id or target_title != last_title or target_artist != last_artist:
+                        return
                     with open(cover_manager.cover_path, "rb") as f:
-                        b64_data = base64.b64encode(f.read()).decode('utf-8')
+                        raw_image = f.read()
+                    b64_data = base64.b64encode(raw_image).decode('utf-8')
+                    if target_cover_request_id != cover_request_id or target_title != last_title or target_artist != last_artist:
+                        return
+                    mime = "image/png" if raw_image.startswith(b"\x89PNG") else "image/jpeg"
+                    cover_data_url = f"data:{mime};base64,{b64_data}"
+                    current_cover_base64 = cover_data_url
+                    # Attach to the track payload so reconnecting clients receive the cover too
+                    if last_track_payload and last_track_payload.get("title") == target_title and last_track_payload.get("artist") == target_artist:
+                        last_track_payload["cover"] = cover_data_url
                     print(f"Broadcasting base64 cover image to frontend ({len(b64_data)} bytes)")
                     await broadcast({
-                        "type": "cover_ready", 
-                        "base64": f"data:image/jpeg;base64,{b64_data}"
+                        "type": "cover_ready",
+                        "base64": cover_data_url
                     })
                 except Exception as e:
                     print(f"Error encoding cover: {e}")
@@ -1103,7 +1258,7 @@ async def monitor_media():
                 "artist": target_artist
             })
             
-            # 1. Fetch synced lyrics dictionary (offload to thread pool with a timeout of 5.0 seconds)
+            # 1. Fetch synced lyrics dictionary (offload to thread pool with a timeout of 45 seconds)
             try:
                 lyrics_dict = await asyncio.wait_for(
                     asyncio.to_thread(
@@ -1113,10 +1268,10 @@ async def monitor_media():
                         artist=target_artist, 
                         title=target_title
                     ),
-                    timeout=25.0
+                    timeout=45.0
                 )
             except asyncio.TimeoutError:
-                print(f"Lyrics fetch timed out after 25.0s for: '{target_title}' by '{target_artist}'")
+                print(f"Lyrics fetch timed out after 45.0s for: '{target_title}' by '{target_artist}'")
                 lyrics_dict = {"offset": 0.0, "lyrics": []}
                 
             raw_lyrics = lyrics_dict.get("lyrics", [])
@@ -1129,12 +1284,12 @@ async def monitor_media():
             )
             
             # 3. Fetch Spotify features (offload to thread pool)
-            s_bpm, s_energy, s_valence = await asyncio.to_thread(
+            s_bpm, s_energy, s_valence, s_valid = await asyncio.to_thread(
                 bpm_provider.fetch_spotify_audio_features, target_title, target_artist
             )
-            
+
             # Use Spotify features if valid, otherwise fallback to heuristics
-            if s_bpm != 120.0 or s_energy != 0.5:
+            if s_valid:
                 bpm_val, energy_val, valence_val = s_bpm, s_energy, s_valence
             else:
                 bpm_val, energy_val, valence_val = h_bpm, h_energy, h_valence
@@ -1148,9 +1303,10 @@ async def monitor_media():
                 # Calculate a realistic duration of the line to prevent typing/stretching trailing over instrumental gaps
                 gap_to_next = next_time - line["time"]
                 text_words = line["text"].split()
-                # Use a tighter estimation (approx 0.35s per word + 0.8s) to type slightly faster than the singer.
-                # This prevents the "falling behind" effect when the singer finishes a sentence quickly.
-                estimated_dur = len(text_words) * 0.35 + 0.8
+                # Estimate the vocalist's pace from character count (~11 chars/sec sung speech)
+                # so the word fill tracks the singer as closely as possible when the lyric
+                # source has no real word-level timestamps.
+                estimated_dur = len(line["text"]) * 0.09 + 0.5
                 
                 # If the line already has word timestamps, ensure line_duration covers all of them
                 pre_words = line.get("words", [])
@@ -1166,14 +1322,22 @@ async def monitor_media():
                 if not words:
                     words = []
                     if text_words:
-                        play_duration = line_duration  # Flow perfectly to the end of the line
-                        word_gap = play_duration / len(text_words)
+                        # Distribute word start times proportionally to SYLLABLE count —
+                        # much closer to a vocalist's natural pacing than character length.
+                        # Finish at ~90% of the line window so the fill leads slightly
+                        # instead of trailing behind sudden vocal speed-ups.
+                        weights = [estimate_word_weight(w) for w in text_words]
+                        total_weight = sum(weights)
+                        play_span = line_duration * 0.9
+                        elapsed = 0.0
                         for idx, w in enumerate(text_words):
                             suffix = " " if idx < len(text_words) - 1 else ""
                             words.append({
-                                "time": line["time"] + (idx * word_gap),
+                                "time": line["time"] + elapsed,
                                 "text": w + suffix
                             })
+                            if total_weight > 0:
+                                elapsed += play_span * (weights[idx] / total_weight)
                 
                 # Apply stretching and dots to words
                 stretched_words = []
@@ -1201,65 +1365,77 @@ async def monitor_media():
                 # Reconstruct the line text from the stretched words
                 line_text = "".join(reconstructed_text_parts).strip()
                 
-                intensity = bpm_provider.get_line_intensity(line, next_line, bpm_val)
-                processed_lyrics.append({
+                intensity = bpm_provider.get_line_intensity(line, next_line, bpm_val, energy_val)
+
+                # "Favorite part" flag: repeated lines are the chorus/hook — the same
+                # segment platforms like Instagram surface as the song's popular clip
+                norm_raw = re.sub(r'[^a-z0-9\s]', '', line["text"].lower()).strip()
+                is_highlight = norm_raw in getattr(bpm_provider, "repeated_lyrics", set())
+
+                processed_line = {
                     "time": line["time"],
                     "text": line_text if line_text else line["text"],
                     "words": stretched_words,
                     "intensity": intensity,
+                    "is_highlight": is_highlight,
                     "duration": line_duration
-                })
+                }
+                if "media" in line:
+                    processed_line["media"] = line["media"]
+                    media_url = register_media_file(line["media"])
+                    if media_url:
+                        processed_line["media_url"] = media_url
+                processed_lyrics.append(processed_line)
             
-            # Second pass: compute climax scores and mark ultimate climax lines dynamically
+            # Second pass: compute climax scores and mark ultimate climax lines dynamically.
+            # Scores are computed strictly from the RAW source text (never from the
+            # stretched display text we generate ourselves — scoring our own stretching
+            # used to inflate slow calm lines into climaxes), and vocal density is
+            # normalized against the song's OWN median pace instead of absolute values.
             if processed_lyrics:
+                cps_values = sorted(l["intensity"]["cps"] for l in processed_lyrics if l["text"].strip())
+                median_cps = cps_values[len(cps_values) // 2] if cps_values else 4.0
+                median_cps = max(1.0, median_cps)
+
                 scores = []
-                for line in processed_lyrics:
-                    text = line["text"]  # This is the STRETCHED text
+                for idx, line in enumerate(processed_lyrics):
+                    raw_text = raw_lyrics[idx]["text"] if idx < len(raw_lyrics) else line["text"]
+                    stripped = raw_text.strip()
                     intensity = line["intensity"]
-                    
-                    # Base score from CPS and level
-                    score = intensity["cps"] + (intensity["level"] * 3.0)
-                    
-                    # Keyword density boost (each matched keyword adds points)
-                    keyword_count = intensity.get("matched_keywords", 0)
-                    score += keyword_count * 2.5
-                    
-                    # Elongated vowels detection on BOTH original (intensity flag) 
-                    # AND the stretched text we display
-                    has_elongation_original = intensity.get("has_elongation", False)
-                    has_elongation_stretched = bool(re.search(r'([aeiouAEIOU])\1{2,}', text))
-                    has_any_elongation = has_elongation_original or has_elongation_stretched
-                    
-                    if has_any_elongation:
-                        score += 12.0
-                    
-                    # ALL CAPS text boost (check stretched text)
-                    stripped = text.strip()
+
+                    if not stripped:
+                        scores.append(0.0)
+                        continue
+
+                    score = 0.0
+
+                    # Chorus/hook membership — the part of the song everyone waits for
+                    if line.get("is_highlight", False):
+                        score += 8.0
+
+                    # Vocal density relative to this song's own pace (genre-independent):
+                    # a line sung noticeably faster than the song's median stands out
+                    density_ratio = intensity["cps"] / median_cps
+                    score += max(0.0, min(8.0, (density_ratio - 1.0) * 6.0))
+
+                    # Explicit intensity markers baked into the SOURCE lyrics
+                    if intensity.get("has_elongation", False):  # e.g. "NOOOO", "whyyy"
+                        score += 10.0
                     if stripped.isupper() and len(stripped) > 3:
                         score += 8.0
-                    
-                    # Exclamation marks boost
-                    excl_count = text.count("!")
+                    excl_count = raw_text.count("!")
                     if excl_count > 0:
                         score += 2.0 + excl_count * 1.5
-                    
-                    # Question marks with emotional words (e.g. "WHAT ABOUT ME?")
-                    if "?" in text and keyword_count >= 2:
-                        score += 4.0
-                    
-                    # Short, punchy lines with high intensity are often climax moments
-                    word_count = len(text.split())
-                    if word_count <= 5 and keyword_count >= 2 and intensity["level"] >= 2:
-                        score += 3.0
-                    
-                    # Repeated chorus lines that are also uppercase or elongated
-                    norm_check = re.sub(r'[^a-z0-9\s]', '', text.lower()).strip()
-                    is_repeated = norm_check in (bpm_provider.repeated_lyrics if hasattr(bpm_provider, 'repeated_lyrics') else set())
-                    if is_repeated and (stripped.isupper() or has_any_elongation):
-                        score += 6.0
-                        
+
+                    # Meaningful intensity keywords (strong/emotional words only)
+                    score += intensity.get("matched_keywords", 0) * 2.0
+
+                    # Late-song bonus: final choruses usually hit the hardest
+                    if target_duration > 0 and line["time"] > target_duration * 0.55:
+                        score += 2.0
+
                     scores.append(score)
-                
+
                 # Debug: print top 5 scoring lines
                 scored_lines = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
                 print(f"\n--- Top 5 Climax Candidates ---")
@@ -1267,24 +1443,18 @@ async def monitor_media():
                     line_text = processed_lyrics[idx]["text"][:50]
                     lvl = processed_lyrics[idx]["intensity"]["level"]
                     print(f"  #{rank+1}: Score={sc:.1f} Level={lvl} | \"{line_text}\"")
-                
-                # Find the top threshold
+
+                # Selection: take the top-N lines (N proportional to song length, 3-8),
+                # with sane floors so weak lines never qualify but a single outlier
+                # can no longer starve the rest of the song of climaxes.
                 max_score = max(scores) if scores else 0.0
-                climax_threshold = max(20.0, max_score * 0.90)
-                
-                # First pass: identify all candidates above threshold
-                candidates = []
-                for idx, line in enumerate(processed_lyrics):
-                    if scores[idx] >= climax_threshold and scores[idx] >= 20.0:
-                        candidates.append((idx, scores[idx]))
-                
-                # Cap at maximum 8 climax lines (keep only highest scoring)
-                MAX_CLIMAX_LINES = 8
-                if len(candidates) > MAX_CLIMAX_LINES:
-                    candidates.sort(key=lambda x: x[1], reverse=True)
-                    candidates = candidates[:MAX_CLIMAX_LINES]
-                
-                climax_indices = {idx for idx, _ in candidates}
+                max_climax = max(3, min(8, len(processed_lyrics) // 8))
+                climax_indices = set()
+                for idx, sc in scored_lines:
+                    if len(climax_indices) >= max_climax:
+                        break
+                    if sc >= 8.0 and sc >= max_score * 0.55:
+                        climax_indices.add(idx)
                 
                 climax_count = 0
                 for idx, line in enumerate(processed_lyrics):
@@ -1325,7 +1495,10 @@ async def monitor_media():
                     "offset": current_track_offset,
                     "duration": target_duration
                 }
-                
+                # Include the cover if it was already downloaded, so this (re)broadcast carries it
+                if current_cover_base64:
+                    last_track_payload["cover"] = current_cover_base64
+
                 # Broadcast immediately
                 await broadcast(last_track_payload)
                 print(f"Successfully loaded lyrics for '{target_title}' and broadcasted. Offset={current_track_offset:.2f}s")
@@ -1350,7 +1523,6 @@ async def monitor_media():
         try:
             # Check for force sync trigger
             force_sync = False
-            global force_sync_trigger
             if force_sync_trigger:
                 force_sync_trigger = False
                 force_sync = True
@@ -1448,11 +1620,15 @@ async def monitor_media():
                     source_app = source
                     if audio_analyzer:
                         audio_analyzer.set_target_app(source)
+                        audio_analyzer.reset_adaptation()
                     current_line_index = -1
                     
                     # Force close all climax popups on track change
                     close_all_popups("track_change")
                     cover_manager.delete_cover()
+                    current_cover_base64 = None
+                    current_accent_rgb = None
+                    cover_request_id += 1
                     if popup_close_task:
                         popup_close_task.cancel()
                         popup_close_task = None
@@ -1460,7 +1636,8 @@ async def monitor_media():
                     last_popup_spawn_time = 0.0
                     
                     duration = track_info.get("duration", 0.0)
-                    
+                    album = track_info.get("album", "")
+
                     # Load cached offset immediately to prevent sync lag in early seconds
                     current_track_offset = 0.0
                     cache_path = resolve_lyrics_cache_path(artist, title, duration)
@@ -1502,27 +1679,35 @@ async def monitor_media():
                         
                     # Start async background load task
                     lyrics_load_task = asyncio.create_task(
-                        fetch_and_process_track_details(title, artist, source, duration)
+                        fetch_and_process_track_details(title, artist, source, duration, album, cover_request_id)
                     )
                 else:
-                    # Standard playback tracking without blocking seeking
-                    # Calculate previous extrapolated position before updating
-                    previous_extrapolated = last_raw_position + (current_time - last_clock_time) if not is_paused else last_raw_position
-                    
+                    # Standard playback tracking without blocking seeking.
+                    # Extrapolate from our smooth local clock rather than the raw OS
+                    # position: GSMTC reports positions in coarse steps (often slightly
+                    # behind the audio), and snapping to every report makes the lyric
+                    # clock hiccup backwards — felt as a delay after instrumental gaps.
+                    previous_extrapolated = local_position + (current_time - last_clock_time) if not is_paused else local_position
+
                     is_seeking = force_sync
-                    
+
                     if position != last_raw_position or is_paused != last_is_paused:
                         # OS updated position or pause state. Detect manual scrub/rewind.
                         if last_position is not None and abs(position - previous_extrapolated) > 2.0:
                             is_seeking = True
-                            
-                        # Authoritative update from OS snapshot
-                        local_position = position
+
+                        if is_seeking or abs(position - previous_extrapolated) >= 1.2:
+                            # Genuine jump — accept the OS position outright
+                            local_position = position
+                        else:
+                            # Small disagreement is GSMTC quantization noise — glide
+                            # 30% toward the OS position instead of jumping
+                            local_position = previous_extrapolated + (position - previous_extrapolated) * 0.3
                         last_raw_position = position
-                        last_clock_time = current_time
                     else:
                         # Extrapolate playback time if not paused
                         local_position = previous_extrapolated
+                    last_clock_time = current_time
                         
                 if is_seeking:
                     close_all_popups("seek_detected")
@@ -1575,11 +1760,11 @@ async def monitor_media():
                 # Prune manually/externally closed windows to prevent referencing dead windows
                 popup_windows = [w for w in popup_windows if w in webview.windows]
 
-                # Close individual popups that have expired in audio timeline + 5.0 seconds post-typing
+                # Close individual popups that have expired in audio timeline + 3.0 seconds post-typing
                 current_audio_time = local_position + current_track_offset
                 expired_windows = []
                 for win in list(popup_windows):
-                    if hasattr(win, "end_time") and current_audio_time >= (win.end_time + 5.0):
+                    if hasattr(win, "end_time") and current_audio_time >= (win.end_time + 3.0):
                         expired_windows.append(win)
                 for win in expired_windows:
                     safe_destroy_window(win)
@@ -1594,11 +1779,22 @@ async def monitor_media():
                     else:
                         break
                 
-                # Dynamically set desktop window shaking based on active intensity
+                # Dynamically set desktop window shaking: only during the song's favorite
+                # parts — the chorus/hook (the segment platforms like Instagram feature)
+                # and the ultimate climax lines. Ordinary lines never enable shaking.
                 if active_line_index >= 0:
-                    should_shake_windows = enable_shake and (lyrics_data[active_line_index]["intensity"]["level"] == 3) and not is_paused
+                    active_intensity_line = lyrics_data[active_line_index]
+                    lyric_hot = active_intensity_line.get("is_ultimate_climax", False) or \
+                                active_intensity_line.get("is_highlight", False)
+                    new_shake_state = enable_shake and lyric_hot and not is_paused
+                    new_main_shake = new_shake_state
                 else:
-                    should_shake_windows = False
+                    new_shake_state = False
+                    new_main_shake = False
+                if new_shake_state != should_shake_windows or new_main_shake != should_shake_main:
+                    print(f"[SHAKE] should_shake={new_shake_state} main={new_main_shake} (line {active_line_index}, popups={len(popup_windows)})")
+                should_shake_windows = new_shake_state
+                should_shake_main = new_main_shake
                     
                 # Update global playback sync states for the background shake thread
                 current_playback_position = local_position
@@ -1727,6 +1923,8 @@ async def monitor_media():
                         # Force close popups and cleanup cover
                         close_all_popups("idle_no_track")
                         cover_manager.delete_cover()
+                        current_cover_base64 = None
+                        cover_request_id += 1
                         if popup_close_task:
                             popup_close_task.cancel()
                             popup_close_task = None
@@ -1817,12 +2015,40 @@ import socketserver
 import urllib.parse
 
 class LocalMediaHandler(http.server.SimpleHTTPRequestHandler):
+    def _resolve_media_path(self):
+        parsed = urllib.parse.urlparse(self.path)
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 2 or parts[0] != "media":
+            return None
+
+        token = urllib.parse.unquote(parts[1])
+        with allowed_media_lock:
+            file_path = allowed_media_files.get(token)
+
+        if not file_path:
+            return None
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in MEDIA_EXTENSIONS or not os.path.isfile(file_path):
+            return None
+        return file_path
+
+    def do_GET(self):
+        if not self._resolve_media_path():
+            self.send_error(404, "Media not found")
+            return
+        super().do_GET()
+
+    def do_HEAD(self):
+        if not self._resolve_media_path():
+            self.send_error(404, "Media not found")
+            return
+        super().do_HEAD()
+
     def translate_path(self, path):
-        parsed = urllib.parse.urlparse(path)
-        qs = urllib.parse.parse_qs(parsed.query)
-        if 'path' in qs:
-            return qs['path'][0]
-        return ""
+        return self._resolve_media_path() or os.devnull
+
+    def log_message(self, format, *args):
+        pass  # Suppress noisy HTTP request logs
 
 def start_media_server():
     try:
@@ -1834,6 +2060,10 @@ def start_media_server():
         print(f"[MEDIA SERVER] Failed to start: {e}")
 
 if __name__ == "__main__":
+    # Prevent WebView2's persistent profile from serving stale cached UI assets
+    # after app.html/style.css/app.js are updated
+    os.environ.setdefault('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', '--disable-http-cache')
+
     create_default_config()
     
     # 1. Launch Async Server thread (WebSocket and Media monitoring)
@@ -1854,7 +2084,7 @@ if __name__ == "__main__":
     except AttributeError:
         base_path = os.path.abspath(".")
         
-    html_path = os.path.join(base_path, "web", "index.html")
+    html_path = os.path.join(base_path, "web", "app.html")
     if not os.path.exists(html_path):
         print(f"Error: HTML assets not found at {html_path}", file=sys.stderr)
         sys.exit(1)
@@ -1874,27 +2104,47 @@ if __name__ == "__main__":
                     webview.OPEN_DIALOG, allow_multiple=False, file_types=file_types
                 )
                 if result:
-                    # Windows paths have backslashes, let's normalize to forward slashes for URLs
-                    return result[0].replace('\\', '/')
+                    media_path = os.path.abspath(os.path.normpath(result[0]))
+                    media_url = register_media_file(media_path)
+                    if not media_url:
+                        return None
+                    return {
+                        "path": media_path.replace('\\', '/'),
+                        "url": media_url
+                    }
                 return None
             except Exception as e:
                 print(f"Error picking media file: {e}")
                 return None
 
+    # Open centered on the primary screen
+    MAIN_W, MAIN_H = 850, 600
+    try:
+        import ctypes
+        screen_w = ctypes.windll.user32.GetSystemMetrics(0)
+        screen_h = ctypes.windll.user32.GetSystemMetrics(1)
+        win_x = max(0, (screen_w - MAIN_W) // 2)
+        win_y = max(0, (screen_h - MAIN_H) // 2)
+    except Exception:
+        win_x, win_y = None, None
+
     window = webview.create_window(
-        title="Untitled - LyricPad", 
-        url=html_path, 
-        width=850, 
-        height=600, 
+        title="Untitled - LyricPad",
+        url=html_path,
+        width=MAIN_W,
+        height=MAIN_H,
+        x=win_x,
+        y=win_y,
         resizable=True,
         text_select=True,
         js_api=Api()
     )
     
     # Start pywebview window loop (blocks until closed)
-    # Set private_mode=False to use a persistent user data cache folder,
-    # preventing the [WinError 32] file lock warning on temp folder cleanup.
-    webview.start(private_mode=False)
+    # Set private_mode=True to force a new temporary profile (incognito),
+    # which effectively clears the HTML/CSS cache on every startup so design changes are visible.
+    # Note: This may cause a harmless [WinError 32] warning in the console on exit.
+    webview.start(private_mode=True)
     print("Window closed. Exiting...")
     
     # Gracefully stop the background asyncio loop

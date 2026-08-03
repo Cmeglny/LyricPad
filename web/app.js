@@ -6,6 +6,14 @@ let lyricOffset = 0.0;
 let isLoadingLyrics = false;
 let isLyricsNotFound = false;
 
+// Per-track cover memory: lets us restore artwork instantly when a recently played
+// track comes back (e.g. after another app briefly steals the media session)
+let currentTrackKey = null;
+let displayedCoverKey = null;
+const coverCache = {};
+const coverCacheKeys = [];
+const COVER_CACHE_LIMIT = 15;
+
 // UI Elements
 const tabTitle = document.getElementById('tab-title');
 const lyricsHistory = document.getElementById('lyrics-history');
@@ -33,6 +41,78 @@ const fsLyricContainer = document.getElementById('fs-lyric-container');
 const fsBtnMenu = document.getElementById('fs-btn-menu');
 const fsExitBtn = document.getElementById('fs-exit-btn');
 
+// Fullscreen now-playing / progress elements
+const fsCover = document.getElementById('fs-cover');
+const fsTitle = document.getElementById('fs-title');
+const fsArtist = document.getElementById('fs-artist');
+const fsTimeCurrent = document.getElementById('fs-time-current');
+const fsTimeTotal = document.getElementById('fs-time-total');
+const fsProgressFill = document.getElementById('fs-progress-fill');
+const fsProgressBar = document.getElementById('fs-progress');
+const fsPlayBtn = document.getElementById('fs-play-btn');
+const fsPrevBtn = document.getElementById('fs-prev-btn');
+const fsNextBtn = document.getElementById('fs-next-btn');
+let lastFsSecond = -1;
+let lastFsPlayState = null;
+
+function sendMediaControl(cmd) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ action: "media_control", command: cmd }));
+    }
+}
+
+function sendSeek(positionSec) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ action: "seek", position: positionSec }));
+    }
+}
+
+if (fsPlayBtn) fsPlayBtn.addEventListener('click', () => sendMediaControl('playpause'));
+if (fsPrevBtn) fsPrevBtn.addEventListener('click', () => sendMediaControl('previous'));
+if (fsNextBtn) fsNextBtn.addEventListener('click', () => sendMediaControl('next'));
+
+if (fsProgressBar) {
+    fsProgressBar.addEventListener('click', (e) => {
+        const dur = currentTrack && currentTrack.duration ? currentTrack.duration : 0;
+        if (dur <= 0) return;
+        const rect = fsProgressBar.getBoundingClientRect();
+        const frac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+        const target = frac * dur;
+        sendSeek(target);
+        localTime = target;  // optimistic UI update; backend confirms via position broadcast
+        lastFrameTime = performance.now();
+    });
+}
+
+function formatTime(seconds) {
+    if (!seconds || seconds < 0 || !isFinite(seconds)) return "0:00";
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function updateFsUi() {
+    const dur = currentTrack && currentTrack.duration ? currentTrack.duration : 0;
+    if (fsProgressFill) {
+        const frac = dur > 0 ? Math.min(1, Math.max(0, localTime / dur)) : 0;
+        fsProgressFill.style.transform = `scaleX(${frac.toFixed(4)})`;
+    }
+    const curSec = Math.floor(localTime);
+    if (curSec !== lastFsSecond && fsTimeCurrent) {
+        lastFsSecond = curSec;
+        fsTimeCurrent.innerText = formatTime(localTime);
+    }
+    // Cover glow and lyric glow breathe with the live bass energy
+    if (fsOverlay) {
+        fsOverlay.style.setProperty('--fs-glow', smoothBassEnergy.toFixed(3));
+    }
+    // Play/pause button reflects the actual playback state
+    if (fsPlayBtn && lastFsPlayState !== isPaused) {
+        lastFsPlayState = isPaused;
+        fsPlayBtn.innerText = isPaused ? '▶' : '⏸';
+    }
+}
+
 // Status Bar Elements
 const statusSource = document.getElementById('status-source');
 const statusIntensity = document.getElementById('status-intensity');
@@ -46,16 +126,18 @@ let appSettings = {
     typewriter: true,
     popups: true,
     shake: true,
+    shakeIntensity: 100,  // percent: 10-150
     blur: true,
     fsTransition: 'fade'
 };
 
 let activeFsMediaIndex = -1;
 
-function mediaServerUrl(filePath) {
+function mediaServerUrl(filePath, mediaUrl) {
+    if (mediaUrl) return mediaUrl;
     if (!filePath) return null;
     if (/^(https?:|data:)/i.test(filePath)) return filePath;
-    return `http://127.0.0.1:8766/?path=${encodeURIComponent(filePath)}`;
+    return null;
 }
 
 function clearFsMedia() {
@@ -70,6 +152,9 @@ function clearFsMedia() {
     }
     if (fsMediaOverlay) {
         fsMediaOverlay.style.display = 'none';
+    }
+    if (fsOverlay) {
+        fsOverlay.classList.remove('has-active-media');
     }
 }
 
@@ -107,7 +192,7 @@ function handleFsMediaChange(lineIndex) {
     }
 
     const path = lyrics[lineIndex].media;
-    const url = mediaServerUrl(path);
+    const url = mediaServerUrl(path, lyrics[lineIndex].media_url);
     if (!url) {
         clearFsMedia();
         return;
@@ -132,6 +217,9 @@ function handleFsMediaChange(lineIndex) {
     if (fsMediaOverlay) {
         fsMediaOverlay.style.display = 'block';
     }
+    if (fsOverlay) {
+        fsOverlay.classList.add('has-active-media');
+    }
 }
 
 function initEqualizerCanvas() {
@@ -154,7 +242,10 @@ class LyricEngine {
         
         this.historyEl = document.getElementById('lyrics-history');
         this.currentEl = document.getElementById('current-line-span');
+        this.nextEl = document.getElementById('lyrics-next');
         this.fsContainer = document.getElementById('fs-lyric-container');
+        this.fsPrevEl = document.getElementById('fs-lyric-prev');
+        this.fsNextEl = document.getElementById('fs-lyric-next');
         
         this.wordNodes = [];
         this.fsWordNodes = [];
@@ -165,7 +256,10 @@ class LyricEngine {
         this.currentIndex = -1;
         if(this.historyEl) this.historyEl.textContent = "";
         if(this.currentEl) this.currentEl.textContent = "";
+        if(this.nextEl) this.nextEl.textContent = "";
         if(this.fsContainer) this.fsContainer.textContent = "";
+        if(this.fsPrevEl) this.fsPrevEl.textContent = "";
+        if(this.fsNextEl) this.fsNextEl.textContent = "";
         this.wordNodes = [];
         this.fsWordNodes = [];
     }
@@ -217,8 +311,17 @@ class LyricEngine {
         
         if (index === -1) {
             if(this.historyEl) this.historyEl.textContent = "";
-            if(this.currentEl) this.currentEl.textContent = "";
-            if(this.fsContainer) this.fsContainer.textContent = "";
+            if(this.nextEl) this.nextEl.textContent = "";
+            if(this.fsPrevEl) this.fsPrevEl.textContent = "";
+            if(this.fsNextEl) this.fsNextEl.textContent = "";
+            if (this.lyrics.length > 0) {
+                // Intro before the first lyric line — show the pulsing note
+                if(this.currentEl) this.currentEl.innerHTML = '<span class="instrumental-note">♪</span>';
+                if(this.fsContainer) this.fsContainer.innerHTML = '<span class="instrumental-note">♪</span>';
+            } else {
+                if(this.currentEl) this.currentEl.textContent = "";
+                if(this.fsContainer) this.fsContainer.textContent = "";
+            }
             this.wordNodes = [];
             this.fsWordNodes = [];
             if (typeof handleFsMediaChange === 'function') handleFsMediaChange(-1);
@@ -249,9 +352,8 @@ class LyricEngine {
         if(this.currentEl) this.currentEl.innerHTML = "";
         if(this.fsContainer) {
             this.fsContainer.innerHTML = "";
-            if (line.intensity && line.intensity.level === 3 || line.text.includes('(')) {
+            if ((line.intensity && line.intensity.level === 3) || line.text.includes('(')) {
                 this.fsContainer.classList.add('climax-text');
-                const fsBackground = document.getElementById('fs-background');
                 if (fsBackground) {
                     fsBackground.classList.add('climax-flash');
                     setTimeout(() => fsBackground.classList.remove('climax-flash'), 150);
@@ -264,8 +366,13 @@ class LyricEngine {
         this.wordNodes = [];
         this.fsWordNodes = [];
 
-        if (!line.words || line.words.length === 0) {
-            let t = line.text.trim();
+        const trimmedText = line.text.trim();
+        if (!trimmedText) {
+            // Instrumental gap marker in the LRC — show a pulsing note instead of a blank hole
+            if (this.currentEl) this.currentEl.innerHTML = '<span class="instrumental-note">♪</span>';
+            if (this.fsContainer) this.fsContainer.innerHTML = '<span class="instrumental-note">♪</span>';
+        } else if (!line.words || line.words.length === 0) {
+            let t = trimmedText;
             if (isCaps) t = t.toUpperCase();
             if(this.currentEl) this.currentEl.textContent = t;
             if(this.fsContainer) this.fsContainer.textContent = t;
@@ -275,15 +382,29 @@ class LyricEngine {
                 let wt = w.text;
                 if (isCaps) wt = wt.toUpperCase();
 
+                // Calculate dynamic fill duration based on the timestamp difference:
+                // the fill should complete right when the next word starts, tracking the vocalist
+                let duration = 0.3;
+                if (i < line.words.length - 1) {
+                    duration = line.words[i+1].time - w.time;
+                } else if (i > 0) {
+                    duration = Math.min(2.0, w.time - line.words[i-1].time);
+                }
+                duration = Math.max(0.1, Math.min(duration, 3.0));
+                const transitionStyle = `background-position ${duration.toFixed(2)}s linear`;
+
                 if (this.currentEl) {
                     const span = document.createElement('span');
                     span.className = 'lyric-char';
+                    span.style.transition = transitionStyle;
                     span.textContent = wt;
                     this.currentEl.appendChild(span);
-                    
+
                     this.wordNodes.push({
                         el: span,
                         time: w.time,
+                        duration: duration,
+                        transitionStyle: transitionStyle,
                         active: false
                     });
                 }
@@ -291,17 +412,81 @@ class LyricEngine {
                 if (this.fsContainer) {
                     const fsSpan = document.createElement('span');
                     fsSpan.className = 'fs-char';
+                    fsSpan.style.transition = transitionStyle;
                     fsSpan.textContent = wt;
                     this.fsContainer.appendChild(fsSpan);
                     this.fsWordNodes.push({
                         el: fsSpan,
                         time: w.time,
+                        duration: duration,
+                        transitionStyle: transitionStyle,
                         active: false
                     });
                 }
             }
+
+            // Force a style flush so the freshly inserted spans get their unfilled state
+            // computed BEFORE any 'active' class lands. Without this, the first word's
+            // fill transition is skipped and it appears instantly filled.
+            if (this.currentEl) void this.currentEl.offsetWidth;
+            if (this.fsContainer) void this.fsContainer.offsetWidth;
+        }
+
+        // Soft slide-up entrance for the new active line (main + fullscreen)
+        if (this.currentEl) {
+            this.currentEl.classList.remove('line-in');
+            void this.currentEl.offsetWidth;
+            this.currentEl.classList.add('line-in');
+        }
+        if (this.fsContainer) {
+            this.fsContainer.classList.remove('line-in');
+            void this.fsContainer.offsetWidth;
+            this.fsContainer.classList.add('line-in');
         }
         
+        // 3. Build upcoming lines below the active lyric
+        if (this.nextEl) {
+            this.nextEl.innerHTML = '';
+            const endIdx = Math.min(this.lyrics.length, index + 6);
+            for (let i = index + 1; i < endIdx; i++) {
+                let nextText = this.lyrics[i].text.trim();
+                if (!nextText) continue;
+                const nextIntensity = this.lyrics[i].intensity;
+                if (nextIntensity && nextIntensity.is_caps) {
+                    nextText = nextText.toUpperCase();
+                }
+
+                const lineDiv = document.createElement('div');
+                lineDiv.className = 'next-line';
+                lineDiv.textContent = nextText;
+                this.nextEl.appendChild(lineDiv);
+            }
+        }
+
+        // 4. Fullscreen context: previous line above, next two lines below
+        if (this.fsPrevEl) {
+            let prevText = "";
+            for (let i = index - 1; i >= 0; i--) {
+                const t = this.lyrics[i].text.trim();
+                if (t) { prevText = t; break; }
+            }
+            this.fsPrevEl.textContent = prevText;
+        }
+        if (this.fsNextEl) {
+            this.fsNextEl.innerHTML = '';
+            let added = 0;
+            for (let i = index + 1; i < this.lyrics.length && added < 2; i++) {
+                const t = this.lyrics[i].text.trim();
+                if (!t) continue;
+                const div = document.createElement('div');
+                div.className = 'fs-next-line';
+                div.textContent = t;
+                this.fsNextEl.appendChild(div);
+                added++;
+            }
+        }
+
+        // Trigger media loading for full screen mode
         if (typeof handleFsMediaChange === 'function') handleFsMediaChange(index);
     }
 
@@ -327,33 +512,69 @@ class LyricEngine {
         for (let i = 0; i < this.wordNodes.length; i++) {
             const wNode = this.wordNodes[i];
             const isActive = time >= wNode.time;
-            
+
             if (wNode.active !== isActive) {
                 wNode.active = isActive;
-                wNode.el.className = isActive ? 'lyric-char active' : 'lyric-char';
-                
+                // If playback is already far past this word (seek / late join),
+                // fill it instantly instead of slowly animating a stale word
+                const fillInstantly = isActive && (time - wNode.time) > (wNode.duration + 0.2);
+                this._applyWordState(wNode, 'lyric-char', isActive, fillInstantly);
+
                 if (this.fsWordNodes[i]) {
                     this.fsWordNodes[i].active = isActive;
-                    this.fsWordNodes[i].el.className = isActive ? 'fs-char active' : 'fs-char';
+                    this._applyWordState(this.fsWordNodes[i], 'fs-char', isActive, fillInstantly);
                 }
             }
+        }
+    }
+
+    _applyWordState(wNode, baseClass, isActive, instant) {
+        if (instant) {
+            wNode.el.style.transition = 'none';
+            wNode.el.className = `${baseClass} active`;
+            void wNode.el.offsetWidth;
+            wNode.el.style.transition = wNode.transitionStyle;
+        } else {
+            wNode.el.className = isActive ? `${baseClass} active` : baseClass;
         }
     }
 }
 
 const lyricEngine = new LyricEngine();
 
+function prettySourceName(sourceApp) {
+    // Turns raw AUMIDs like "SpotifyMusic_zpdnekdrzrea0!Spotify" into a friendly app name
+    if (!sourceApp) return "Unknown";
+    const s = sourceApp.toLowerCase();
+    if (s.includes("spotify")) return "Spotify";
+    if (s.includes("ytmusic") || s.includes("youtubemusic")) return "YouTube Music";
+    if (s.includes("brave")) return "Brave";
+    if (s.includes("chrome")) return "Chrome";
+    if (s.includes("msedge") || s.includes("edge")) return "Edge";
+    if (s.includes("firefox")) return "Firefox";
+    if (s.includes("opera")) return "Opera";
+    if (s.includes("vlc")) return "VLC";
+    if (s.includes("applemusic") || s.includes("itunes")) return "Apple Music";
+    if (s.includes("system")) return "System";
+    // Fallback: take the segment after '!' (AUMID app id) or the last dotted segment, strip hashes
+    let name = sourceApp.split('!').pop().split('.').pop();
+    name = name.replace(/_.*$/, '').replace(/\.exe$/i, '');
+    return name || sourceApp;
+}
+
 function connectWebSocket() {
     socket = new WebSocket("ws://localhost:8765");
-    
+
     socket.onopen = () => {
-        statusSource.innerText = "Status: Online (Waiting)";
+        statusSource.innerText = "Waiting for music...";
+        statusSource.classList.remove('offline');
         console.log("Connected to Python backend.");
         if (typeof sendSettings === 'function') sendSettings();
     };
 
     socket.onclose = () => {
-        statusSource.innerText = "Status: Offline";
+        statusSource.innerText = "Offline";
+        statusSource.classList.add('offline');
         console.log("Disconnected. Reconnecting in 2s...");
         setTimeout(connectWebSocket, 2000);
     };
@@ -379,9 +600,7 @@ function connectWebSocket() {
             handleOffsetBroadcast(msg.offset);
         } else if (msg.type === "audio") {
             currentBassEnergy = msg.bass;
-            if (msg.kick > 0.0) {
-                currentKickIntensity = msg.kick;
-            }
+            currentKickIntensity = msg.kick || 0.0;
         } else if (msg.type === "cover_ready") {
             if (socket && socket.readyState === WebSocket.OPEN) {
                 socket.send(JSON.stringify({ action: "log", message: "Frontend received cover_ready websocket message. Loading image..." }));
@@ -409,6 +628,37 @@ function handleTrackChange(data) {
     isLoadingLyrics = false;
     isLyricsNotFound = (lyrics.length === 0 && !data.plain_lyrics && data.title !== "Untitled");
     
+    // Clear previous timeout if any
+    if (window.coverTimeout) clearTimeout(window.coverTimeout);
+
+    currentTrackKey = `${data.artist}|${data.title}`;
+
+    if (data.cover) {
+        // Payload already carries the cover (reconnect or late lyrics load) — apply it directly
+        // instead of arming the clear-timer, which would wipe the background to black.
+        loadCoverColor(data.cover);
+    } else if (coverCache[currentTrackKey]) {
+        // We already have this track's cover from earlier in the session — restore instantly
+        loadCoverColor(coverCache[currentTrackKey]);
+    } else if (currentTrackKey === displayedCoverKey) {
+        // Same track re-broadcast without a cover — keep what's on screen
+    } else {
+        // Wait 4 seconds for the new cover. If it doesn't arrive, then clear the old one.
+        // This allows a smooth crossfade if the cover arrives quickly.
+        window.coverTimeout = setTimeout(() => {
+            const appBg = document.getElementById('app-background');
+            if (appBg) appBg.style.backgroundImage = '';
+            const trackCover = document.getElementById('track-cover');
+            if (trackCover) {
+                trackCover.removeAttribute('src');
+                trackCover.src = 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=';
+            }
+            if (fsBackground) {
+                fsBackground.style.background = '';
+            }
+        }, 4000);
+    }
+    
     // Update Title and Info
     const filename = `${data.artist} - ${data.title}`;
     if (tabTitle) tabTitle.innerText = filename;
@@ -426,8 +676,14 @@ function handleTrackChange(data) {
     document.documentElement.style.setProperty('--fs-color-core', `hsla(${hue}, ${saturation}%, ${lightness}%, 0.25)`);
     
     // Status info
-    statusSource.innerText = `Source: ${data.source_app.split('.').pop()}`;
-    statusBpm.innerText = `BPM: ${Math.round(data.bpm)}`;
+    statusSource.innerText = prettySourceName(data.source_app);
+    statusBpm.innerText = `${Math.round(data.bpm)} BPM`;
+
+    // Fullscreen now-playing card
+    if (fsTitle) fsTitle.innerText = data.title || "—";
+    if (fsArtist) fsArtist.innerText = data.artist || "—";
+    if (fsTimeTotal) fsTimeTotal.innerText = formatTime(data.duration || 0);
+    lastFsSecond = -1;
     updateOffsetDisplay();
     
     lyricEngine.setLyrics(lyrics);
@@ -446,19 +702,137 @@ function handleTrackChange(data) {
     updateEqualizerState();
 }
 
+function extractDominantColor(img) {
+    const SAMPLE = 32;
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    canvas.width = SAMPLE;
+    canvas.height = SAMPLE;
+    ctx.drawImage(img, 0, 0, SAMPLE, SAMPLE);
+    const data = ctx.getImageData(0, 0, SAMPLE, SAMPLE).data;
+
+    const buckets = Array.from({ length: 24 }, () => ({ w: 0, r: 0, g: 0, b: 0 }));
+    let avgR = 0, avgG = 0, avgB = 0, count = 0, colorful = 0;
+
+    for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        avgR += r; avgG += g; avgB += b; count++;
+
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+        const l = (mx + mn) / 510;
+        const d = mx - mn;
+        const s = d === 0 ? 0 : d / (255 - Math.abs(mx + mn - 255));
+        // Skip gray, near-black and near-white pixels — they never read as "the cover's color"
+        if (s < 0.18 || l < 0.12 || l > 0.92) continue;
+        colorful++;
+
+        let h;
+        if (mx === r) h = ((g - b) / d) % 6;
+        else if (mx === g) h = (b - r) / d + 2;
+        else h = (r - g) / d + 4;
+        h = Math.round(h * 60);
+        if (h < 0) h += 360;
+
+        const bi = Math.floor(h / 15) % 24;
+        const w = s * (1 - Math.abs(l - 0.5)); // favor saturated, mid-lightness pixels
+        buckets[bi].w += w;
+        buckets[bi].r += r * w;
+        buckets[bi].g += g * w;
+        buckets[bi].b += b * w;
+    }
+
+    let r, g, b;
+    const best = buckets.reduce((a, c) => (c.w > a.w ? c : a), { w: 0 });
+    if (best.w > 0 && colorful > count * 0.04) {
+        r = Math.round(best.r / best.w);
+        g = Math.round(best.g / best.w);
+        b = Math.round(best.b / best.w);
+    } else {
+        // Mostly monochrome cover — fall back to the average
+        r = Math.round(avgR / count);
+        g = Math.round(avgG / count);
+        b = Math.round(avgB / count);
+    }
+    return clampColorForText(r, g, b);
+}
+
+function clampColorForText(r, g, b) {
+    // RGB -> HSL, clamp lightness/saturation so the fill stays readable on the dark UI
+    const rn = r / 255, gn = g / 255, bn = b / 255;
+    const mx = Math.max(rn, gn, bn), mn = Math.min(rn, gn, bn);
+    let h, s, l = (mx + mn) / 2;
+    if (mx === mn) { h = 0; s = 0; }
+    else {
+        const d = mx - mn;
+        s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+        switch (mx) {
+            case rn: h = (gn - bn) / d + (gn < bn ? 6 : 0); break;
+            case gn: h = (bn - rn) / d + 2; break;
+            default: h = (rn - gn) / d + 4;
+        }
+        h /= 6;
+    }
+    l = Math.min(0.72, Math.max(0.5, l));
+    if (s > 0.05) s = Math.max(0.45, Math.min(0.9, s));
+
+    const hue2rgb = (p, q, t) => {
+        if (t < 0) t += 1;
+        if (t > 1) t -= 1;
+        if (t < 1 / 6) return p + (q - p) * 6 * t;
+        if (t < 1 / 2) return q;
+        if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+        return p;
+    };
+    let R, G, B;
+    if (s === 0) { R = G = B = l; }
+    else {
+        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+        const p = 2 * l - q;
+        R = hue2rgb(p, q, h + 1 / 3);
+        G = hue2rgb(p, q, h);
+        B = hue2rgb(p, q, h - 1 / 3);
+    }
+    return [Math.round(R * 255), Math.round(G * 255), Math.round(B * 255)];
+}
+
 function loadCoverColor(base64Data) {
     const img = new Image();
     img.onload = () => {
+        if (window.coverTimeout) clearTimeout(window.coverTimeout);
+
+        // Remember this cover for the current track (bounded FIFO cache)
+        if (currentTrackKey) {
+            if (!(currentTrackKey in coverCache)) {
+                coverCacheKeys.push(currentTrackKey);
+                if (coverCacheKeys.length > COVER_CACHE_LIMIT) {
+                    delete coverCache[coverCacheKeys.shift()];
+                }
+            }
+            coverCache[currentTrackKey] = base64Data;
+            displayedCoverKey = currentTrackKey;
+        }
+
+        // Set App Background (The new glassmorphism background)
+        const appBg = document.getElementById('app-background');
+        if (appBg) {
+            appBg.style.backgroundImage = `url('${base64Data}')`;
+        }
+        
+        // Set track cover image
+        const trackCover = document.getElementById('track-cover');
+        if (trackCover) {
+            trackCover.src = base64Data;
+        }
+        if (fsCover) {
+            fsCover.src = base64Data;
+        }
+
         try {
-            // Use a tiny canvas to extract the average color of the album cover
-            const canvas = document.createElement("canvas");
-            const ctx = canvas.getContext("2d", { willReadFrequently: true });
-            canvas.width = 1;
-            canvas.height = 1;
-            
-            ctx.drawImage(img, 0, 0, 1, 1);
-            const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
-            
+            // Extract the DOMINANT color of the album cover (not the muddy average):
+            // downsample, skip gray/too-dark/too-bright pixels, bucket by hue and pick
+            // the heaviest bucket, then clamp lightness for text readability.
+            const [r, g, b] = extractDominantColor(img);
+
             if (socket && socket.readyState === WebSocket.OPEN) {
                 socket.send(JSON.stringify({ action: "log", message: `Frontend Extracted Colors - R:${r} G:${g} B:${b}` }));
             }
@@ -466,17 +840,10 @@ function loadCoverColor(base64Data) {
             // Export raw RGB and a solid core color for UI usage
             document.documentElement.style.setProperty('--fs-color-rgb', `${r}, ${g}, ${b}`);
             document.documentElement.style.setProperty('--fs-color-core', `rgb(${r}, ${g}, ${b})`);
-            
-            // Set App Background (The new glassmorphism background)
-            const appBg = document.getElementById('app-background');
-            if (appBg) {
-                appBg.style.backgroundImage = `url('${base64Data}')`;
-            }
-            
-            // Set track cover image
-            const trackCover = document.getElementById('track-cover');
-            if (trackCover) {
-                trackCover.src = base64Data;
+
+            // Share the dominant color with the backend so climax popups match the song
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ action: "set_accent", rgb: [r, g, b] }));
             }
             
             // Optional: embed the blurred cover into the background for richer texture
@@ -488,6 +855,12 @@ function loadCoverColor(base64Data) {
         } catch (e) {
             if (socket && socket.readyState === WebSocket.OPEN) {
                 socket.send(JSON.stringify({ action: "log", message: `Frontend Canvas Error: ${e.toString()}` }));
+            }
+            // Fallback: set the fsBackground without the color gradient
+            if (fsBackground) {
+                fsBackground.style.background = `url('${base64Data}')`;
+                fsBackground.style.backgroundSize = "cover";
+                fsBackground.style.backgroundPosition = "center";
             }
         }
     };
@@ -555,6 +928,8 @@ function clockTick(now) {
         // Run physics decay even when paused so the window returns to rest smoothly
         animateEqualizer(localTime, delta);
     }
+    // 3. Fullscreen progress bar, elapsed time and cover glow
+    if (isFullscreen) updateFsUi();
     lastFrameTime = now;
     requestAnimationFrame(clockTick);
 }
@@ -748,7 +1123,7 @@ function updateTheme(level, bpm) {
     currentActiveThemeLevel = level;
     
     // Remove all themes
-    document.body.className = "";
+    document.body.classList.remove('theme-calm', 'theme-energetic', 'theme-dramatic');
     
     let intensityLabel = "CALM";
     
@@ -761,16 +1136,16 @@ function updateTheme(level, bpm) {
     document.documentElement.style.setProperty('--beat-duration', `${beatDuration}s`);
     
     if (level === 0) {
-        document.body.className = "theme-calm";
+        document.body.classList.add("theme-calm");
         intensityLabel = "AMBIENT";
     } else if (level === 1) {
-        document.body.className = "theme-calm";
+        document.body.classList.add("theme-calm");
         intensityLabel = "NORMAL";
     } else if (level === 2) {
-        document.body.className = "theme-energetic";
+        document.body.classList.add("theme-energetic");
         intensityLabel = "ENERGETIC";
     } else if (level === 3) {
-        document.body.className = "theme-dramatic";
+        document.body.classList.add("theme-dramatic");
         intensityLabel = "DRAMATIC";
         
         // Reset overrides and rely on CSS beat-duration variables
@@ -780,6 +1155,9 @@ function updateTheme(level, bpm) {
     
     if (statusIntensity) {
         statusIntensity.innerText = intensityLabel;
+        statusIntensity.classList.remove('level-energetic', 'level-dramatic');
+        if (level === 2) statusIntensity.classList.add('level-energetic');
+        else if (level === 3) statusIntensity.classList.add('level-dramatic');
     }
 }
 
@@ -791,13 +1169,16 @@ if (syncBtn) {
             socket.send(JSON.stringify({ action: "force_sync" }));
             
             // Visual feedback
-            const originalText = syncBtn.innerText;
-            syncBtn.innerText = "🔄 Syncing...";
-            syncBtn.style.opacity = "0.7";
-            setTimeout(() => {
-                syncBtn.innerText = originalText;
-                syncBtn.style.opacity = "1";
-            }, 800);
+            const spanEl = syncBtn.querySelector('span');
+            if (spanEl) {
+                const originalText = spanEl.innerText;
+                spanEl.innerText = "Syncing...";
+                syncBtn.style.opacity = "0.7";
+                setTimeout(() => {
+                    spanEl.innerText = originalText;
+                    syncBtn.style.opacity = "1";
+                }, 800);
+            }
         }
         
         // Force clock to start running if it was stuck due to GSMTC false-pause bug
@@ -983,6 +1364,12 @@ function loadSettings() {
     document.getElementById('setting-blur').checked = appSettings.blur;
     const transitionSelect = document.getElementById('setting-fs-transition');
     if (transitionSelect) transitionSelect.value = appSettings.fsTransition || 'fade';
+    const intensitySlider = document.getElementById('setting-shake-intensity');
+    if (intensitySlider) {
+        intensitySlider.value = appSettings.shakeIntensity;
+        const label = document.getElementById('shake-intensity-value');
+        if (label) label.innerText = `${appSettings.shakeIntensity}%`;
+    }
     
     applyClientSettings();
     sendSettings();
@@ -1009,6 +1396,7 @@ function sendSettings() {
             settings: {
                 popups: appSettings.popups,
                 shake: appSettings.shake,
+                shake_intensity: (appSettings.shakeIntensity || 100) / 100.0,
             }
         }));
     }
@@ -1033,6 +1421,24 @@ if (transitionSelect) {
     });
 }
 
+const shakeIntensitySlider = document.getElementById('setting-shake-intensity');
+if (shakeIntensitySlider) {
+    shakeIntensitySlider.addEventListener('input', (e) => {
+        appSettings.shakeIntensity = parseInt(e.target.value, 10) || 100;
+        const label = document.getElementById('shake-intensity-value');
+        if (label) label.innerText = `${appSettings.shakeIntensity}%`;
+        saveSettings();
+    });
+}
+
+function closeModalWithAnimation(modal) {
+    modal.classList.add('closing');
+    setTimeout(() => {
+        modal.style.display = 'none';
+        modal.classList.remove('closing');
+    }, 300);
+}
+
 if (settingsBtn) {
     settingsBtn.addEventListener('click', () => {
         settingsModal.style.display = 'flex';
@@ -1041,7 +1447,7 @@ if (settingsBtn) {
 
 if (settingsCloseBtn) {
     settingsCloseBtn.addEventListener('click', () => {
-        settingsModal.style.display = 'none';
+        closeModalWithAnimation(settingsModal);
     });
 }
 
@@ -1115,12 +1521,34 @@ if (fsExitBtn) {
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && isFullscreen) {
         toggleFullscreen();
+        return;
+    }
+    // Fullscreen media shortcuts: Space = play/pause, arrows = seek ±5s
+    if (!isFullscreen || isEditing) return;
+    if (e.code === 'Space') {
+        e.preventDefault();
+        sendMediaControl('playpause');
+    } else if (e.code === 'ArrowRight' || e.code === 'ArrowLeft') {
+        e.preventDefault();
+        const dur = currentTrack && currentTrack.duration ? currentTrack.duration : 0;
+        if (dur > 0) {
+            const target = Math.min(dur, Math.max(0, localTime + (e.code === 'ArrowRight' ? 5 : -5)));
+            sendSeek(target);
+            localTime = target;
+            lastFrameTime = performance.now();
+        }
     }
 });
 
 settingsModal.addEventListener('click', (e) => {
     if (e.target === settingsModal) {
-        settingsModal.style.display = 'none';
+        closeModalWithAnimation(settingsModal);
+    }
+});
+
+mediaEditorModal.addEventListener('click', (e) => {
+    if (e.target === mediaEditorModal) {
+        closeModalWithAnimation(mediaEditorModal);
     }
 });
 
@@ -1140,7 +1568,7 @@ if (editMediaBtn) {
 
 if (mediaEditorCloseBtn) {
     mediaEditorCloseBtn.addEventListener('click', () => {
-        mediaEditorModal.style.display = 'none';
+        closeModalWithAnimation(mediaEditorModal);
     });
 }
 
@@ -1154,31 +1582,35 @@ function renderMediaEditorList() {
         const s = (line.time % 60).toFixed(2).padStart(5, '0');
         
         const timeSpan = document.createElement('span');
-        timeSpan.className = 'time';
+        timeSpan.className = 'media-row-time';
         timeSpan.innerText = `[${m}:${s}]`;
         
         const textSpan = document.createElement('span');
-        textSpan.className = 'text';
+        textSpan.className = 'media-row-text';
         textSpan.innerText = line.text;
         textSpan.title = line.text;
         
         const pathSpan = document.createElement('span');
-        pathSpan.className = 'media-path';
+        pathSpan.className = 'media-status';
         pathSpan.innerText = line.media ? line.media.split(/[\\/]/).pop() : 'No Media';
         if (line.media) pathSpan.title = line.media;
         
         const addBtn = document.createElement('button');
-        addBtn.innerText = '📷 Select Media';
+        addBtn.className = line.media ? 'media-btn has-media' : 'media-btn';
+        addBtn.innerHTML = '🎬 <span>Select Media</span>';
         addBtn.onclick = async () => {
             if (window.pywebview && window.pywebview.api) {
                 const result = await window.pywebview.api.pick_media_file();
                 if (result) {
-                    lyrics[index].media = result;
+                    const mediaPath = typeof result === 'string' ? result : result.path;
+                    const mediaUrl = typeof result === 'string' ? null : result.url;
+                    lyrics[index].media = mediaPath;
+                    if (mediaUrl) lyrics[index].media_url = mediaUrl;
                     if (socket && socket.readyState === WebSocket.OPEN) {
                         socket.send(JSON.stringify({
                             action: "set_line_media",
                             index: index,
-                            media_path: result
+                            media_path: mediaPath
                         }));
                     }
                     renderMediaEditorList();
@@ -1189,14 +1621,19 @@ function renderMediaEditorList() {
         row.appendChild(timeSpan);
         row.appendChild(textSpan);
         row.appendChild(pathSpan);
-        row.appendChild(addBtn);
+        
+        const btnGroup = document.createElement('div');
+        btnGroup.style.display = 'flex';
+        btnGroup.style.gap = '8px';
+        btnGroup.appendChild(addBtn);
         
         if (line.media) {
             const clearBtn = document.createElement('button');
             clearBtn.innerText = '✕';
-            clearBtn.className = 'clear-btn';
+            clearBtn.className = 'media-btn remove-media';
             clearBtn.onclick = () => {
                 delete lyrics[index].media;
+                delete lyrics[index].media_url;
                 if (socket && socket.readyState === WebSocket.OPEN) {
                     socket.send(JSON.stringify({
                         action: "clear_line_media",
@@ -1205,9 +1642,10 @@ function renderMediaEditorList() {
                 }
                 renderMediaEditorList();
             };
-            row.appendChild(clearBtn);
+            btnGroup.appendChild(clearBtn);
         }
         
+        row.appendChild(btnGroup);
         mediaEditorList.appendChild(row);
     });
 }

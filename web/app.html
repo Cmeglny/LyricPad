@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LyricPad</title>
-    <link rel="stylesheet" href="style_v2.css">
+    <link id="main-css" rel="stylesheet" href="style.css?v=18">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
 </head>
 <body>
@@ -53,6 +53,7 @@
                     <div class="current-line" id="current-line-span">
                         <span style="opacity: 0.5;">No music playing...</span>
                     </div>
+                    <div class="lyrics-next" id="lyrics-next"></div>
                 </div>
                 
                 <!-- Edit Lyrics View (Hidden by default) -->
@@ -83,8 +84,6 @@
                     <div class="track-title" id="tab-title">Offline</div>
                     <div class="track-status">
                         <span id="status-source">Waiting for track...</span>
-                        <span id="status-intensity" class="badge">NORMAL</span>
-                        <span id="status-bpm" class="badge">BPM: —</span>
                     </div>
                 </div>
             </div>
@@ -93,10 +92,14 @@
                 <div class="equalizer paused" id="equalizer"></div>
             </div>
 
-            <div class="player-controls">
-                <button class="icon-btn" id="offset-dec-btn" title="Shift lyrics later (-0.5s)">⏪</button>
-                <span id="status-offset" class="offset-display">0.0s</span>
-                <button class="icon-btn" id="offset-inc-btn" title="Shift lyrics earlier (+0.5s)">⏩</button>
+            <div class="player-right">
+                <span id="status-intensity" class="badge">NORMAL</span>
+                <span id="status-bpm" class="badge">— BPM</span>
+                <div class="offset-control" title="Lyric sync offset">
+                    <button class="offset-btn" id="offset-dec-btn" title="Shift lyrics later (-0.5s)">−</button>
+                    <span id="status-offset" class="offset-display">0.0s</span>
+                    <button class="offset-btn" id="offset-inc-btn" title="Shift lyrics earlier (+0.5s)">+</button>
+                </div>
             </div>
         </footer>
     </div>
@@ -109,9 +112,34 @@
             <img id="fs-img-bg" class="fs-img-bg" style="display:none;">
             <div id="fs-media-overlay" class="fs-media-overlay" style="display:none;"></div>
         </div>
+        <div class="fs-glass-overlay"></div>
         <div id="fs-content" class="fs-content">
+            <div id="fs-lyric-prev" class="fs-lyric-prev"></div>
             <div id="fs-lyric-container" class="fs-lyric-container"></div>
+            <div id="fs-lyric-next" class="fs-lyric-next"></div>
         </div>
+
+        <!-- Now Playing card (bottom-left) -->
+        <div class="fs-nowplaying">
+            <img id="fs-cover" class="fs-cover" alt="" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=">
+            <div class="fs-track-meta">
+                <div id="fs-title" class="fs-title">—</div>
+                <div id="fs-artist" class="fs-artist">—</div>
+            </div>
+        </div>
+
+        <!-- Playback controls + progress (bottom-center) -->
+        <div class="fs-progress-wrap">
+            <div class="fs-media-controls">
+                <button class="fs-ctrl-btn" id="fs-prev-btn" title="Previous track">⏮</button>
+                <button class="fs-ctrl-btn fs-ctrl-main" id="fs-play-btn" title="Play / Pause">⏸</button>
+                <button class="fs-ctrl-btn" id="fs-next-btn" title="Next track">⏭</button>
+            </div>
+            <span id="fs-time-current" class="fs-time">0:00</span>
+            <div class="fs-progress" id="fs-progress" title="Click to seek"><div id="fs-progress-fill" class="fs-progress-fill"></div></div>
+            <span id="fs-time-total" class="fs-time">0:00</span>
+        </div>
+
         <div class="fs-controls">
             <span id="fs-exit-btn" class="fs-exit-btn">⛶ Exit (ESC)</span>
         </div>
@@ -157,6 +185,16 @@
                 </div>
                 <div class="setting-item">
                     <div class="setting-info">
+                        <h3>Shake Intensity</h3>
+                        <p>How hard windows shake during climax moments.</p>
+                    </div>
+                    <div class="setting-slider-wrap">
+                        <input type="range" id="setting-shake-intensity" min="10" max="150" step="10" value="100">
+                        <span id="shake-intensity-value">100%</span>
+                    </div>
+                </div>
+                <div class="setting-item">
+                    <div class="setting-info">
                         <h3>Background Blur</h3>
                         <p>Glassmorphism blur. Disable for better performance.</p>
                     </div>
@@ -197,6 +235,6 @@
         </div>
     </div>
 
-    <script src="app_v2.js"></script>
+    <script src="app.js?v=21"></script>
 </body>
 </html>
